@@ -22,3 +22,25 @@ os.makedirs(SERVER_DATA_DIR, exist_ok=True)
 PERMISSION_UNLOCK = "UNLOCK"
 PERMISSION_START = "START"
 VALID_PERMISSIONS = {PERMISSION_UNLOCK, PERMISSION_START}
+
+# --- TLS Configuration ---
+# Directory where certificates are stored
+CERT_DIR = os.path.join(os.path.dirname(__file__), '..', 'certs')
+
+# Ensure certs directory exists (optional, good for setup)
+# os.makedirs(CERT_DIR, exist_ok=True)
+
+# Certificate Authority
+CA_CERT_FILE = os.path.join(CERT_DIR, 'ca-cert.pem')
+
+# Car Server Certificates
+CAR_CERT_FILE = os.path.join(CERT_DIR, 'car-cert.pem')
+CAR_KEY_FILE = os.path.join(CERT_DIR, 'car-key.pem')
+
+# App Client Certificates (Example - could be user-specific in a real app)
+APP_CERT_FILE = os.path.join(CERT_DIR, 'app-cert.pem')
+APP_KEY_FILE = os.path.join(CERT_DIR, 'app-key.pem')
+
+# Check if files exist (optional, but good for debugging setup)
+if not os.path.exists(CA_CERT_FILE):
+    print(f"Warning: CA Certificate not found at {CA_CERT_FILE}")

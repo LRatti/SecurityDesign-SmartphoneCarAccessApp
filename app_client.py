@@ -1,6 +1,7 @@
 # app/app_client.py
 import socket
 import logging
+import ssl # <-- Import ssl
 import time
 import json # For pretty printing responses
 from utils import config, network_utils
@@ -16,53 +17,138 @@ class AppClient:
         #   The public_key below should be derived from the actual private key.
         self.public_key = f"pubkey_for_{self.user_id}" # Placeholder! Replace
         self.last_delegation_id = None # Store last created delegation ID for easy revocation
+        self.ssl_context = self._create_ssl_context()
+
+    def _create_ssl_context(self):
+        # Use PROTOCOL_TLS_CLIENT for client-side context
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        try:
+            logging.info(f"Loading APP cert chain: {config.APP_CERT_FILE}, {config.APP_KEY_FILE}")
+            context.load_cert_chain(certfile=config.APP_CERT_FILE, keyfile=config.APP_KEY_FILE)
+
+            logging.info(f"Loading CA cert for server verification: {config.CA_CERT_FILE}")
+            # Load CA cert to verify the server's certificate
+            context.load_verify_locations(cafile=config.CA_CERT_FILE)
+            context.verify_mode = ssl.CERT_REQUIRED # Verify server cert
+
+            # Hostname checking - IMPORTANT for production
+            # If server cert CN is 'localhost' or IP, set check_hostname=True
+            # If using a self-signed cert without matching CN, set to False for testing ONLY
+            context.check_hostname = False # Set to True if car cert CN matches config.CAR_IP/hostname
+            logging.warning("SSL Hostname Check is DISABLED. Enable in production.")
+
+            # Optional: Set specific TLS versions or cipher suites
+            # context.minimum_version = ssl.TLSVersion.TLSv1_3
+
+            logging.info("SSL context created successfully for mTLS.")
+            return context
+        except ssl.SSLError as e:
+            logging.critical(f"SSL Error creating client context: {e}")
+            raise SystemExit("Failed to initialize SSL context - check certificate paths and permissions.")
+        except FileNotFoundError as e:
+             logging.critical(f"Certificate file not found: {e}")
+             raise SystemExit("Failed to initialize SSL context - certificate file missing.")
+        except Exception as e:
+             logging.critical(f"Unexpected error creating SSL context: {e}")
+             raise SystemExit("Failed to initialize SSL context.")
+        
 
     def _connect(self, address):
-        """Establishes a connection to the given address."""
+        """Establishes a TLS connection to the given address."""
+        if not self.ssl_context:
+             logging.error("Cannot connect: SSL context not initialized.")
+             return None
+
+        raw_sock = None
+        ssl_sock = None
         try:
-            # Add a timeout to connections
-            sock = socket.create_connection(address, timeout=5.0)
-            logging.info(f"Connected to {address}")
-            return sock
+            logging.debug(f"Attempting to create raw socket connection to {address}")
+            # 1. Create standard socket first
+            raw_sock = socket.create_connection(address, timeout=5.0)
+            logging.debug(f"Raw socket connected to {address}")
+
+            # 2. Wrap the socket with the SSL context
+            logging.debug(f"Attempting to wrap socket for TLS and perform handshake")
+            # server_hostname should match the CN in the car's certificate if check_hostname=True
+            server_hostname = address[0] if self.ssl_context.check_hostname else None
+            ssl_sock = self.ssl_context.wrap_socket(raw_sock, server_hostname=server_hostname)
+
+            logging.info(f"TLS connection established successfully to {address}")
+            # --- Log Server Cert Info (Optional Debugging) ---
+            try:
+                server_cert = ssl_sock.getpeercert()
+                if server_cert:
+                    subject = dict(x[0] for x in server_cert.get('subject', []))
+                    logging.debug(f"Server Cert Subject: {subject}")
+                else:
+                     logging.warning("Could not get peer certificate details from server.")
+            except Exception as e:
+                 logging.warning(f"Error getting peer certificate from server: {e}")
+            # -------------------------------------------------
+            return ssl_sock # Return the secure socket
+
         except socket.timeout:
             logging.error(f"Connection to {address} timed out.")
+            if raw_sock: raw_sock.close()
             return None
         except socket.error as e:
-            logging.error(f"Failed to connect to {address}: {e}")
+            logging.error(f"Socket error connecting to {address}: {e}")
+            if raw_sock: raw_sock.close()
             return None
+        except ssl.SSLCertVerificationError as e:
+             logging.error(f"SSL Certificate Verification Error connecting to {address}: {e}")
+             if ssl_sock: ssl_sock.close()
+             elif raw_sock: raw_sock.close()
+             return None
+        except ssl.SSLError as e:
+             logging.error(f"SSL Error establishing connection to {address}: {e}")
+             if ssl_sock: ssl_sock.close()
+             elif raw_sock: raw_sock.close()
+             return None
+        except Exception as e: # Catch other potential errors during wrap/handshake
+             logging.error(f"Unexpected error during TLS connection to {address}: {e}")
+             if ssl_sock: ssl_sock.close()
+             elif raw_sock: raw_sock.close()
+             return None
 
     def _send_and_receive(self, address, message: dict):
-        """Connects, sends a message, receives a response, and disconnects."""
-        # TODO (AUTH): Before sending, sign relevant parts of the 'message' payload. The signature should be added to the payload.
-        #
+        # App-level crypto (signing) would happen *before* calling this function,
+        # modifying the 'message' dict if needed. TLS handles the transport.
+        # Placeholder comment from original code:
+        # TODO (AUTH): Before sending, sign relevant parts of the 'message' payload.
 
-        # TODO (AUTH): Consider adding a timestamp or nonce to the payload before signing
-        #   to help prevent replay attacks on the server/car side.
-
-        sock = self._connect(address)
-        if not sock:
-            return None
+        # Use the _connect method which now returns an SSLSocket
+        ssl_sock = self._connect(address)
+        if not ssl_sock:
+            return None # Connection failed
 
         response = None
         try:
-            if network_utils.send_message(sock, message):
-                # Add a timeout for receiving data as well
-                sock.settimeout(5.0)
-                response = network_utils.receive_message(sock)
-                # TODO (AUTH): Optionally, verify signature on response from server/car if they sign responses.
-
+            # Use the SSL socket for sending/receiving
+            if network_utils.send_message(ssl_sock, message):
+                # Add a timeout for receiving data on the SSL socket
+                ssl_sock.settimeout(5.0)
+                response = network_utils.receive_message(ssl_sock)
+                # App-level verification of response signature would happen here if needed
+                # TODO (AUTH): Optionally, verify signature on response from server/car
             else:
-                logging.error("Failed to send message.")
+                logging.error("Failed to send message over TLS.")
         except socket.timeout:
              logging.error(f"Receive operation timed out from {address}.")
+        except ssl.SSLError as e:
+            logging.error(f"SSL error during communication with {address}: {e}")
         except Exception as e:
-            logging.error(f"Error during communication with {address}: {e}")
+            logging.error(f"Error during TLS communication with {address}: {e}")
         finally:
-            logging.info(f"Closing connection to {address}")
-            sock.close() # Ensure socket is closed
+            logging.info(f"Closing TLS connection to {address}")
+            try:
+                ssl_sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass # Ignore if already closed
+            ssl_sock.close() # Ensure SSL socket is closed
 
         if response:
-            logging.info(f"Received response: {json.dumps(response, indent=2)}") # Pretty print JSON
+            logging.info(f"Received response: {json.dumps(response, indent=2)}")
         else:
             logging.warning("No response received or error occurred.")
 

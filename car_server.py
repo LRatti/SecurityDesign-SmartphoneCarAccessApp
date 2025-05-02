@@ -2,6 +2,7 @@
 import socket
 import threading
 import logging
+import ssl # <-- Import ssl
 from utils import config, network_utils
 import os
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - CarServer [{car_id}] - %(threadName)s - %(levelname)s - %(message)s')
@@ -19,6 +20,10 @@ class CarServer:
         # Inject car_id into logger extra context for formatting
         self.logger = logging.getLogger(__name__)
         self.logger_adapter = logging.LoggerAdapter(self.logger, {'car_id': self.car_id})
+
+          # --- TLS Setup ---
+        self.ssl_context = self._create_ssl_context()
+
         # TODO (AUTH): Load car's private key securely (e.g., from file/secure element).
         self.car_private_key = None # Replace with actual key object
 
@@ -26,6 +31,34 @@ class CarServer:
         #   to allow offline verification or faster online verification.
         self.user_public_keys_cache = {} # Example: { 'user_id': loaded_public_key_object }
 
+    # --- New Method: Create SSL Context ---
+    def _create_ssl_context(self):
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        try:
+            self._log(logging.INFO, f"Loading CAR cert chain: {config.CAR_CERT_FILE}, {config.CAR_KEY_FILE}")
+            context.load_cert_chain(certfile=config.CAR_CERT_FILE, keyfile=config.CAR_KEY_FILE)
+
+            self._log(logging.INFO, f"Loading CA cert for client verification: {config.CA_CERT_FILE}")
+            # Require client certificate and verify it against our CA
+            context.load_verify_locations(cafile=config.CA_CERT_FILE)
+            context.verify_mode = ssl.CERT_REQUIRED
+
+            # Optional: Set specific TLS versions or cipher suites
+            context.minimum_version = ssl.TLSVersion.TLSv1_3
+            context.set_ciphers('ECDHE+AESGCM:!aNULL') # Example
+
+            self._log(logging.INFO, "SSL context created successfully for mTLS.")
+            return context
+        except ssl.SSLError as e:
+            self._log(logging.CRITICAL, f"SSL Error creating server context: {e}")
+            raise SystemExit("Failed to initialize SSL context - check certificate paths and permissions.")
+        except FileNotFoundError as e:
+             self._log(logging.CRITICAL, f"Certificate file not found: {e}")
+             raise SystemExit("Failed to initialize SSL context - certificate file missing.")
+        except Exception as e:
+             self._log(logging.CRITICAL, f"Unexpected error creating SSL context: {e}")
+             raise SystemExit("Failed to initialize SSL context.")
+        
     def _log(self, level, msg, *args, **kwargs):
         """Helper for logging with car_id context."""
         self.logger_adapter.log(level, msg, *args, **kwargs)
@@ -90,29 +123,52 @@ class CarServer:
         return access_granted
 
 
-    def handle_client(self, client_socket: socket.socket, address):
-        # Assign a name to the thread for better logging
+    def handle_client(self, ssl_client_socket: ssl.SSLSocket, address): # <-- Takes SSLSocket now
         threading.current_thread().name = f"App-{address[0]}:{address[1]}"
-        self._log(logging.INFO, f"Accepted connection from {address}")
+        self._log(logging.INFO, f"TLS connection established with {address}")
+
+        # --- Log Client Cert Info (Optional Debugging) ---
+        try:
+            client_cert = ssl_client_socket.getpeercert()
+            if client_cert:
+                 subject = dict(x[0] for x in client_cert.get('subject', []))
+                 issuer = dict(x[0] for x in client_cert.get('issuer', []))
+                 self._log(logging.DEBUG, f"Client Cert Subject: {subject}")
+                 self._log(logging.DEBUG, f"Client Cert Issuer: {issuer}")
+                 # You could potentially use subject CN or other fields for app-level checks
+            else:
+                 self._log(logging.WARNING, "Could not get peer certificate details.")
+        except Exception as e:
+             self._log(logging.WARNING, f"Error getting peer certificate: {e}")
+        # -------------------------------------------------
+
         try:
             while True:
-                message = network_utils.receive_message(client_socket)
+                # Use the SSL socket for communication
+                message = network_utils.receive_message(ssl_client_socket)
                 if message is None:
-                    break # Error or connection closed
+                    break
 
-                response = self.process_message(message)
+                response = self.process_message(message) # Process logic remains the same
 
                 if response:
-                    if not network_utils.send_message(client_socket, response):
-                         self._log(logging.WARNING, f"Failed to send response to {address}. Closing.")
+                    # Send response over the SSL socket
+                    if not network_utils.send_message(ssl_client_socket, response):
+                         self._log(logging.WARNING, f"Failed to send response to {address}. Closing TLS connection.")
                          break
         except ConnectionResetError:
              self._log(logging.INFO, f"Connection reset by peer {address}")
+        except ssl.SSLError as e:
+            self._log(logging.ERROR, f"SSL Error during communication with {address}: {e}")
         except Exception as e:
             self._log(logging.ERROR, f"Error handling client {address}: {e}")
         finally:
-            self._log(logging.INFO, f"Closing connection from {address}")
-            client_socket.close()
+            self._log(logging.INFO, f"Closing TLS connection from {address}")
+            try:
+                ssl_client_socket.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass # Ignore if already closed
+            ssl_client_socket.close()
 
     def process_message(self, message: dict) -> dict | None:
         msg_type = message.get('type')
@@ -212,19 +268,40 @@ class CarServer:
         return response
 
     def start(self):
+        if not self.ssl_context: # Check if context creation failed
+            self._log(logging.CRITICAL, "Cannot start server without a valid SSL context.")
+            return
+
         try:
             self.server_socket.bind((self.host, self.port))
             self.server_socket.listen(5)
-            self._log(logging.INFO, f"Car server listening on {self.host}:{self.port}")
+            self._log(logging.INFO, f"Car server listening securely (TLS) on {self.host}:{self.port}")
 
             while True:
                  try:
                     client_socket, address = self.server_socket.accept()
-                    client_thread = threading.Thread(target=self.handle_client, args=(client_socket, address), daemon=True)
-                    client_thread.name = f"Handler-{address[0]}:{address[1]}" # Name the thread
-                    client_thread.start()
+                    self._log(logging.INFO, f"Incoming connection attempt from {address}")
+                    # --- Wrap socket with SSL Context ---
+                    try:
+                        ssl_sock = self.ssl_context.wrap_socket(client_socket, server_side=True)
+                        self._log(logging.DEBUG, f"SSL handshake initiated with {address}")
+                        # Handshake happens implicitly here or on first read/write
+                        # You could explicitly call ssl_sock.do_handshake() if needed, but it's often automatic.
+
+                        # Pass the secure socket to the handler thread
+                        client_thread = threading.Thread(target=self.handle_client, args=(ssl_sock, address), daemon=True)
+                        client_thread.name = f"Handler-{address[0]}:{address[1]}"
+                        client_thread.start()
+                    except ssl.SSLError as e:
+                         self._log(logging.ERROR, f"SSL Handshake failed with {address}: {e}. Closing raw socket.")
+                         client_socket.close() # Close the underlying socket if handshake fails
+                    except Exception as e:
+                        self._log(logging.ERROR, f"Error wrapping socket or starting thread for {address}: {e}")
+                        client_socket.close()
+                    # ----------------------------------
+
                  except KeyboardInterrupt:
-                     self._log(logging.INFO, f"Shutdown signal received.")
+                     self._log(logging.INFO, "Shutdown signal received.")
                      break
                  except Exception as e:
                     self._log(logging.ERROR, f"Error accepting connection: {e}")
@@ -232,9 +309,9 @@ class CarServer:
         except socket.error as e:
             self._log(logging.CRITICAL, f"Could not start server on {self.host}:{self.port}. Error: {e}")
         finally:
-            self._log(logging.INFO, f"Shutting down server...")
+            self._log(logging.INFO, "Shutting down server...")
             self.server_socket.close()
-            self._log(logging.INFO, f"Server socket closed.")
+            self._log(logging.INFO, "Server socket closed.")
 
 
 if __name__ == "__main__":
