@@ -1,0 +1,10 @@
+{
+    "besar": {
+        "public_key": "pubkey_for_besar",
+        "license_valid": true
+    },
+    "furkan": {
+        "public_key": "pubkey_for_furkan",
+        "license_valid": true
+    }
+}

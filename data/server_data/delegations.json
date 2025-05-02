@@ -1,0 +1,14 @@
+{
+    "8145e5c3-7a87-45ff-8743-48eafc450010": {
+        "delegation_id": "8145e5c3-7a87-45ff-8743-48eafc450010",
+        "car_id": "CAR_VIN_DEMO_789",
+        "owner_user_id": "besar",
+        "recipient_user_id": "furkan",
+        "permissions": [
+            "UNLOCK",
+            "START"
+        ],
+        "expiry_timestamp": 1746186068.5972714,
+        "status": "revoked"
+    }
+}
