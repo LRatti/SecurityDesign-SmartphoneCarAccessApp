@@ -41,6 +41,10 @@ CAR_KEY_FILE = os.path.join(CERT_DIR, 'car-key.pem')
 APP_CERT_FILE = os.path.join(CERT_DIR, 'app-cert.pem')
 APP_KEY_FILE = os.path.join(CERT_DIR, 'app-key.pem')
 
+# Backend Server Certificates (NEW)
+SERVER_CERT_FILE = os.path.join(CERT_DIR, 'server-cert.pem')
+SERVER_KEY_FILE = os.path.join(CERT_DIR, 'server-key.pem')
+
 # Check if files exist (optional, but good for debugging setup)
 if not os.path.exists(CA_CERT_FILE):
     print(f"Warning: CA Certificate not found at {CA_CERT_FILE}")

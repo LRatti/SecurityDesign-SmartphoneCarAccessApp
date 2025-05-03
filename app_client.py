@@ -19,25 +19,28 @@ class AppClient:
         #   The public_key below should be derived from the actual private key.
         self.public_key = f"pubkey_for_{self.user_id}" # Placeholder! Replace
         self.last_delegation_id = None # Store last created delegation ID for easy revocation
-        self.ssl_context = self._create_ssl_context()
+        # --- TLS Setup ---
+        self.car_ssl_context = self._create_car_ssl_context() # Renamed for clarity
+        self.backend_ssl_context = self._create_backend_ssl_context() # New context for backend
 
-    def _create_ssl_context(self):
+    def _create_car_ssl_context(self):
         # Use PROTOCOL_TLS_CLIENT for client-side context
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         try:
             logging.info(f"Loading APP cert chain: {config.APP_CERT_FILE}, {config.APP_KEY_FILE}")
+            # Uses APP cert/key to authenticate itself to CAR
             context.load_cert_chain(certfile=config.APP_CERT_FILE, keyfile=config.APP_KEY_FILE)
-
             logging.info(f"Loading CA cert for server verification: {config.CA_CERT_FILE}")
             # Load CA cert to verify the server's certificate
+            # Uses CA cert to verify CAR's cert
             context.load_verify_locations(cafile=config.CA_CERT_FILE)
-            context.verify_mode = ssl.CERT_REQUIRED # Verify server cert
-
+            context.verify_mode = ssl.CERT_REQUIRED
             # Hostname checking - IMPORTANT for production
             # If server cert CN is 'localhost' or IP, set check_hostname=True
             # If using a self-signed cert without matching CN, set to False for testing ONLY
             context.check_hostname = False # Set to True if car cert CN matches config.CAR_IP/hostname
-            logging.warning("SSL Hostname Check is DISABLED. Enable in production.")
+            if (not context.check_hostname):
+                logging.warning("SSL Hostname Check is DISABLED. Enable in production.")
 
             # Optional: Set specific TLS versions or cipher suites
             context.minimum_version = ssl.TLSVersion.TLSv1_3
@@ -51,14 +54,46 @@ class AppClient:
              logging.critical(f"Certificate file not found: {e}")
              raise SystemExit("Failed to initialize SSL context - certificate file missing.")
         except Exception as e:
-             logging.critical(f"Unexpected error creating SSL context: {e}")
-             raise SystemExit("Failed to initialize SSL context.")
+             logging.critical(f"Unexpected error creating CAR SSL context: {e}")
+             # Exit or proper handling if context fails
+             raise SystemExit("Failed to initialize CAR SSL context.")
         
+     # --- Create SSL Context for BACKEND connection ---
+    def _create_backend_ssl_context(self):
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        try:
+            logging.info(f"Loading APP cert chain for backend: {config.APP_CERT_FILE}, {config.APP_KEY_FILE}")
+            # Uses APP cert/key to authenticate itself to BACKEND
+            context.load_cert_chain(certfile=config.APP_CERT_FILE, keyfile=config.APP_KEY_FILE)
+
+            logging.info(f"Loading CA cert for backend server verification: {config.CA_CERT_FILE}")
+            # Uses CA cert to verify BACKEND SERVER's cert
+            context.load_verify_locations(cafile=config.CA_CERT_FILE)
+            context.verify_mode = ssl.CERT_REQUIRED
+
+            # Hostname checking for the backend server - IMPORTANT
+            # Set to True if backend server cert CN matches config.SERVER_IP/hostname
+            context.check_hostname = False # Set True if backend cert CN=localhost (for this setup)
+            if not context.check_hostname:
+                 logging.warning("SSL Hostname Check is DISABLED for Backend connection. Enable in production.")
+
+            logging.info("BACKEND SSL context created successfully for mTLS.")
+            return context
+        except ssl.SSLError as e:
+            logging.critical(f"SSL Error creating backend client context: {e}")
+            raise SystemExit("Failed to initialize backend SSL context.")
+        except FileNotFoundError as e:
+             logging.critical(f"Certificate file not found for backend context: {e}")
+             raise SystemExit("Failed to initialize backend SSL context.")
+        except Exception as e:
+             logging.critical(f"Unexpected error creating backend SSL context: {e}")
+             raise SystemExit("Failed to initialize backend SSL context.")
+
 
     def _connect(self, address, target_car_id: str): # <-- Add target_car_id
         """Establishes a TLS connection to the given address."""
-        if not self.ssl_context:
-             logging.error("Cannot connect: SSL context not initialized.")
+        if not self.car_ssl_context: # Use the CAR context
+             logging.error("Cannot connect to car: SSL context not initialized.")
              return None
 
         raw_sock = None
@@ -72,8 +107,8 @@ class AppClient:
             # 2. Wrap the socket with the SSL context
             logging.debug(f"Attempting to wrap socket for TLS and perform handshake")
             # server_hostname should match the CN in the car's certificate if check_hostname=True
-            server_hostname = address[0] if self.ssl_context.check_hostname else None
-            ssl_sock = self.ssl_context.wrap_socket(raw_sock, server_hostname=server_hostname)
+            server_hostname = address[0] if self.car_ssl_context.check_hostname else None
+            ssl_sock = self.car_ssl_context.wrap_socket(raw_sock, server_hostname=server_hostname)
 
             logging.info(f"TLS connection established successfully to {address}")
 
@@ -106,7 +141,6 @@ class AppClient:
                  logging.error(f"Error during backend certificate validation step: {e}")
                  ssl_sock.close()
                  return None
-            # ------------------------------------
 
             # --- Log Server Cert Info (Optional Debugging) ---
             try:
@@ -118,7 +152,7 @@ class AppClient:
                      logging.warning("Could not get peer certificate details from server.")
             except Exception as e:
                  logging.warning(f"Error getting peer certificate from server: {e}")
-            # -------------------------------------------------
+
             return ssl_sock # Return the secure socket
 
         except socket.timeout:
@@ -146,9 +180,66 @@ class AppClient:
              elif raw_sock: raw_sock.close()
              return None
 
+    # --- Connect to Backend using TLS ---
+    def _connect_to_backend_tls(self, address):
+        """Establishes a TLS connection to the BACKEND server."""
+        if not self.backend_ssl_context: # Use the BACKEND context
+             logging.error("Cannot connect to backend: BACKEND SSL context not initialized.")
+             return None
+
+        raw_sock = None
+        ssl_sock = None
+        try:
+            logging.debug(f"Attempting raw socket connection to backend {address}")
+            raw_sock = socket.create_connection(address, timeout=5.0)
+            logging.debug(f"Raw socket connected to backend {address}")
+
+            logging.debug(f"Wrapping socket for backend TLS handshake")
+            # Determine server_hostname for backend connection if needed
+            server_hostname = address[0] if self.backend_ssl_context.check_hostname else None
+            # --- Use self.backend_ssl_context ---
+            ssl_sock = self.backend_ssl_context.wrap_socket(raw_sock, server_hostname=server_hostname)
+
+            logging.info(f"TLS connection established successfully to backend server {address}")
+            # Optional: Log backend server cert details
+            try:
+                server_cert = ssl_sock.getpeercert()
+                if server_cert:
+                    subject = dict(x[0] for x in server_cert.get('subject', []))
+                    logging.debug(f"Backend Server Cert Subject: {subject}")
+            except Exception as e:
+                 logging.warning(f"Error getting peer certificate from backend server: {e}")
+
+            return ssl_sock # Return the secure socket
+
+        except socket.timeout:
+            logging.error(f"Connection to backend {address} timed out.")
+            if raw_sock: raw_sock.close()
+            return None
+        except socket.error as e:
+            logging.error(f"Socket error connecting to backend {address}: {e}")
+            if raw_sock: raw_sock.close()
+            return None
+        except ssl.SSLCertVerificationError as e:
+             logging.error(f"SSL Certificate Verification Error connecting to backend {address}: {e}")
+             if ssl_sock: ssl_sock.close()
+             elif raw_sock: raw_sock.close()
+             return None
+        except ssl.SSLError as e:
+             logging.error(f"SSL Error establishing connection to backend {address}: {e}")
+             if ssl_sock: ssl_sock.close()
+             elif raw_sock: raw_sock.close()
+             return None
+        except Exception as e:
+             logging.error(f"Unexpected error during TLS connection to backend {address}: {e}")
+             if ssl_sock: ssl_sock.close()
+             elif raw_sock: raw_sock.close()
+             return None
+
+    # --- Make validation call use TLS ---
     def _validate_car_certificate_with_server(self, car_id: str, fingerprint: str) -> bool:
-        """Contacts the backend server to validate the car's certificate fingerprint."""
-        logging.info(f"Contacting backend server {self.server_addr} to validate cert for car '{car_id}'")
+        """Contacts the backend server securely (TLS) to validate the car's certificate fingerprint."""
+        logging.info(f"Contacting backend server {self.server_addr} SECURELY to validate cert for car '{car_id}'")
         validation_message = {
             "type": "VALIDATE_CAR_CERT",
             "sender_id": self.user_id,
@@ -158,59 +249,50 @@ class AppClient:
             }
             # TODO (AUTH): Sign this request if backend requires authenticated validation requests
         }
-
-        # --- Connect to Backend (Ideally use TLS for this too!) ---
-        # For simplicity, using plain socket connection as in the original _send_and_receive structure
-        # Replace this block with a TLS-enabled connection if securing backend comms is required.
-        backend_sock = None
+        # --- Use the new TLS connection method for the backend ---
+        backend_tls_sock = None
         try:
-            backend_sock = socket.create_connection(self.server_addr, timeout=5.0)
-            if network_utils.send_message(backend_sock, validation_message):
-                backend_sock.settimeout(5.0)
-                response = network_utils.receive_message(backend_sock)
+            backend_tls_sock = self._connect_to_backend_tls(self.server_addr)
+            if not backend_tls_sock:
+                logging.error("Failed to establish secure connection to backend for validation.")
+                return False # Can't validate if connection fails
+
+            if network_utils.send_message(backend_tls_sock, validation_message):
+                backend_tls_sock.settimeout(5.0)
+                response = network_utils.receive_message(backend_tls_sock)
                 if response and response.get("type") == "VALIDATE_CAR_CERT_ACK" and response.get("payload", {}).get("status") == "VALID":
-                    logging.info("Backend server confirmed certificate validity.")
+                    logging.info("Backend server confirmed certificate validity over TLS.")
                     return True
                 else:
                     reason = response.get("payload", {}).get("reason", "Unknown") if response else "No response"
-                    logging.error(f"Backend server rejected certificate validation: {reason}")
+                    logging.error(f"Backend server rejected certificate validation (via TLS): {reason}")
                     return False
             else:
-                logging.error("Failed to send validation request to backend server.")
+                logging.error("Failed to send validation request to backend server over TLS.")
                 return False
         except socket.timeout:
-            logging.error(f"Connection to backend server {self.server_addr} timed out during validation.")
+            logging.error(f"Connection to backend server {self.server_addr} timed out during TLS validation.")
             return False
-        except socket.error as e:
-            logging.error(f"Socket error communicating with backend server {self.server_addr}: {e}")
+        except ssl.SSLError as e:
+            logging.error(f"SSL error communicating with backend server {self.server_addr} during validation: {e}")
             return False
         except Exception as e:
-            logging.error(f"Unexpected error validating cert with backend: {e}")
+            logging.error(f"Unexpected error validating cert with backend via TLS: {e}")
             return False
         finally:
-             if backend_sock:
-                 logging.debug("Closing connection to backend server after validation.")
-                 backend_sock.close()
-        # --- End Backend Connection Block ---
-
-    def _connect_to_backend_simple(self, address):
-        """ Establishes a basic non-TLS socket connection to the backend. """
-        # WARNING: This is insecure. Ideally, use TLS for backend comms too.
-        try:
-            sock = socket.create_connection(address, timeout=5.0)
-            logging.info(f"(Insecurely) Connected to backend {address}")
-            return sock
-        except socket.timeout:
-            logging.error(f"Connection to backend {address} timed out.")
-            return None
-        except socket.error as e:
-            logging.error(f"Failed to connect to backend {address}: {e}")
-            return None
+             if backend_tls_sock:
+                 logging.debug("Closing secure connection to backend server after validation.")
+                 try:
+                     backend_tls_sock.shutdown(socket.SHUT_RDWR)
+                 except OSError: pass
+                 backend_tls_sock.close()
+        # --- End Backend TLS Connection Block ---
 
     def _send_and_receive(self, address, message: dict, target_car_id: str | None = None):
         """
-        Connects (validating car cert via _connect if applicable),
+        Connects securely (validating car cert via _connect if applicable),
         sends a message, receives a response, and disconnects.
+        Handles both CAR and SERVER addresses using appropriate TLS contexts.
         """
         sock = None # Use generic name, could be TLS or plain socket
 
@@ -230,11 +312,11 @@ class AppClient:
         elif address == self.server_addr:
              # Use the simple, insecure backend connection for now
              # WARNING: This should be upgraded to TLS in a real system.
-             sock = self._connect_to_backend_simple(address)
+             sock = self._connect_to_backend_tls(address)
              if not sock:
-                 logging.error(f"Failed to establish connection to backend server at {address}")
+                 logging.error(f"Failed to establish TLS connection to backend server at {address}")
                  return None
-             logging.debug(f"Plaintext connection established to backend server {address}")
+             logging.debug(f"TLS connection established to backend server {address}")
         else:
              logging.error(f"Cannot send/receive: Unknown address type: {address}")
              return None

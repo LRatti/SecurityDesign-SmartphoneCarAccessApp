@@ -6,7 +6,8 @@ import logging
 import os
 import time
 import uuid # For unique delegation IDs
-import hashlib # <-- Add hashlib
+import hashlib
+import ssl # <-- Import ssl
 from cryptography import x509 # <-- Add cryptography
 from cryptography.hazmat.primitives import hashes as crypto_hashes # <-- Add cryptography hashes
 from cryptography.hazmat.backends import default_backend # <-- Add cryptography backend
@@ -31,8 +32,38 @@ class BackendServer:
         self.car_lock = threading.Lock()
         self.delegation_lock = threading.Lock()
 
+        # --- TLS Setup for Backend Server ---
+        self.server_ssl_context = self._create_server_ssl_context()
+
         # Load initial data
         self.load_data()
+
+     # --- Create Backend Server SSL Context ---
+    def _create_server_ssl_context(self):
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        try:
+            logging.info(f"Loading SERVER cert chain: {config.SERVER_CERT_FILE}, {config.SERVER_KEY_FILE}")
+            context.load_cert_chain(certfile=config.SERVER_CERT_FILE, keyfile=config.SERVER_KEY_FILE)
+            
+            logging.info(f"Loading CA cert for client (app) verification: {config.CA_CERT_FILE}")
+            # Require client certificate and verify it against our CA
+            context.load_verify_locations(cafile=config.CA_CERT_FILE)
+            context.verify_mode = ssl.CERT_REQUIRED # Require app client cert
+
+            # Optional: Set specific TLS versions or cipher suites
+            # context.minimum_version = ssl.TLSVersion.TLSv1_3
+
+            logging.info("Backend Server SSL context created successfully for mTLS.")
+            return context
+        except ssl.SSLError as e:
+            logging.critical(f"SSL Error creating backend server context: {e}")
+            raise SystemExit("Failed to initialize backend SSL context - check certificate paths/permissions.")
+        except FileNotFoundError as e:
+             logging.critical(f"Certificate file not found for backend server: {e}")
+             raise SystemExit("Failed to initialize backend SSL context - certificate file missing.")
+        except Exception as e:
+             logging.critical(f"Unexpected error creating backend SSL context: {e}")
+             raise SystemExit("Failed to initialize backend SSL context.")
 
     def load_data(self):
         """Loads all data from JSON files."""
@@ -101,32 +132,52 @@ class BackendServer:
             logging.error(f"Error calculating certificate fingerprint: {e}")
             return None
 
-    def handle_client(self, client_socket: socket.socket, address):
+    def handle_client(self, ssl_client_socket: ssl.SSLSocket, address): # <-- Takes SSLSocket
         # Assign a name to the thread for better logging
         # NOTE: Communication with the app client for this validation should ideally ALSO use TLS.
         # For simplicity here, we are assuming the channel is secure or accepting the risk for the POC.
         # To add TLS here, you'd wrap client_socket similar to how the car server does.
         threading.current_thread().name = f"Client-{address[0]}:{address[1]}"
-        logging.info(f"Accepted connection from {address}")
+        logging.info(f"Accepted TLS connection from {address} (App Client)")
+
+        # --- Log Client Cert Info ---
+        try:
+            client_cert = ssl_client_socket.getpeercert()
+            if client_cert:
+                 subject = dict(x[0] for x in client_cert.get('subject', []))
+                 logging.debug(f"App Client Cert Subject: {subject}")
+            else:
+                 logging.warning("Could not get peer certificate details from App Client.")
+        except Exception as e:
+             logging.warning(f"Error getting peer certificate from App Client: {e}")
+
         try:
             while True:
-                message = network_utils.receive_message(client_socket)
+                # Use the SSL socket for communication
+                message = network_utils.receive_message(ssl_client_socket)
                 if message is None:
-                    break
+                    break # Error or connection closed gracefully
 
-                response = self.process_message(message)
+                response = self.process_message(message) # Logic remains the same
 
                 if response:
-                    if not network_utils.send_message(client_socket, response):
-                         logging.warning(f"Failed to send response to {address}. Closing connection.")
+                    # Send response over the SSL socket
+                    if not network_utils.send_message(ssl_client_socket, response):
+                         logging.warning(f"Failed to send response to {address}. Closing TLS connection.")
                          break
         except ConnectionResetError:
              logging.info(f"Connection reset by peer {address}")
+        except ssl.SSLError as e:
+             logging.error(f"SSL Error during communication with App Client {address}: {e}")
         except Exception as e:
-            logging.error(f"Error handling client {address}: {e}")
+            logging.error(f"Error handling App Client {address}: {e}")
         finally:
-            logging.info(f"Closing connection from {address}")
-            client_socket.close()
+            logging.info(f"Closing TLS connection from App Client {address}")
+            try:
+                ssl_client_socket.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass # Ignore if already closed
+            ssl_client_socket.close()
 
     def process_message(self, message: dict) -> dict | None:
         """Processes incoming messages and returns a response dictionary or None."""
@@ -451,18 +502,35 @@ class BackendServer:
         return response
 
     def start(self):
+        if not self.server_ssl_context: # Check if context creation failed
+            logging.critical("Cannot start backend server without a valid SSL context.")
+            return
+
         try:
             self.server_socket.bind((self.host, self.port))
             self.server_socket.listen(5)
-            logging.info(f"Backend server listening on {self.host}:{self.port}")
+            logging.info(f"Backend server listening securely (TLS) on {self.host}:{self.port}")
 
             while True:
                 try:
                     client_socket, address = self.server_socket.accept()
-                    client_thread = threading.Thread(target=self.handle_client, args=(client_socket, address), daemon=True)
-                    # Naming the thread helps debugging logs
-                    client_thread.name = f"Handler-{address[0]}:{address[1]}"
-                    client_thread.start()
+                    logging.info(f"Incoming connection attempt from {address}")
+                    # --- Wrap socket with Backend Server SSL Context ---
+                    try:
+                        # Use the server_ssl_context here
+                        ssl_sock = self.server_ssl_context.wrap_socket(client_socket, server_side=True)
+                        logging.debug(f"Backend SSL handshake initiated with {address}")
+
+                        # Pass the secure socket to the handler thread
+                        client_thread = threading.Thread(target=self.handle_client, args=(ssl_sock, address), daemon=True)
+                        client_thread.name = f"Handler-{address[0]}:{address[1]}"
+                        client_thread.start()
+                    except ssl.SSLError as e:
+                         logging.error(f"Backend SSL Handshake failed with {address}: {e}. Closing raw socket.")
+                         client_socket.close()
+                    except Exception as e:
+                        logging.error(f"Error wrapping socket or starting thread for backend connection {address}: {e}")
+                        client_socket.close()
                 except KeyboardInterrupt:
                      logging.info("Shutdown signal received.")
                      break
