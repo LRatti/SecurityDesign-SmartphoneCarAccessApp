@@ -6,7 +6,11 @@ import logging
 import os
 import time
 import uuid # For unique delegation IDs
-from utils import config, network_utils
+import hashlib # <-- Add hashlib
+from cryptography import x509 # <-- Add cryptography
+from cryptography.hazmat.primitives import hashes as crypto_hashes # <-- Add cryptography hashes
+from cryptography.hazmat.backends import default_backend # <-- Add cryptography backend
+from utils import config, network_utils 
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - Server - %(threadName)s - %(levelname)s - %(message)s')
 
@@ -82,8 +86,26 @@ class BackendServer:
         except Exception as e:
             logging.error(f"Unexpected error saving {description}: {e}")
 
+    def _calculate_fingerprint_from_pem(self, cert_pem: str) -> str | None:
+        """Calculates SHA-256 fingerprint of a certificate from PEM string."""
+        try:
+            # Load the certificate from PEM
+            cert = x509.load_pem_x509_certificate(cert_pem.encode('utf-8'), default_backend())
+            # Calculate SHA-256 hash of the DER encoded certificate
+            fingerprint_bytes = cert.fingerprint(crypto_hashes.SHA256())
+            return fingerprint_bytes.hex()
+        except ValueError as e:
+            logging.error(f"Failed to parse certificate PEM: {e}")
+            return None
+        except Exception as e:
+            logging.error(f"Error calculating certificate fingerprint: {e}")
+            return None
+
     def handle_client(self, client_socket: socket.socket, address):
         # Assign a name to the thread for better logging
+        # NOTE: Communication with the app client for this validation should ideally ALSO use TLS.
+        # For simplicity here, we are assuming the channel is secure or accepting the risk for the POC.
+        # To add TLS here, you'd wrap client_socket similar to how the car server does.
         threading.current_thread().name = f"Client-{address[0]}:{address[1]}"
         logging.info(f"Accepted connection from {address}")
         try:
@@ -176,27 +198,38 @@ class BackendServer:
             # In POC, any registered user can register a car. In reality, needs admin/verification.
             car_id = payload.get('car_id')
             owner_user_id = payload.get('owner_user_id')
-            car_public_key = payload.get('car_public_key', "placeholder_car_key") # Optional
+            # --- Expect the full certificate PEM now ---
+            car_certificate_pem = payload.get('car_certificate_pem')
             model = payload.get('model', "Unknown Model")
 
-            if not car_id or not owner_user_id:
-                 response.update({"type": "REGISTER_CAR_NAK", "payload": {"error": "Missing car_id or owner_user_id"}})
+            if not car_id or not owner_user_id or not car_certificate_pem:
+                 response.update({"type": "REGISTER_CAR_NAK", "payload": {"error": "Missing car_id, owner_user_id, or car_certificate_pem"}})
             else:
-                 # Check if owner exists
-                 with self.user_lock:
-                    if owner_user_id not in self.users:
-                        response.update({"type": "REGISTER_CAR_NAK", "payload": {"error": f"Owner user '{owner_user_id}' not registered"}})
-                    else:
-                        # Proceed with registration
-                        with self.car_lock:
-                            if car_id in self.cars:
-                                logging.warning(f"Car '{car_id}' already registered. Updating owner/details.")
-                            self.cars[car_id] = {
-                                'owner_user_id': owner_user_id,
-                                'car_public_key': car_public_key,
-                                'model': model
-                            }
-                            self._save_json(config.CARS_FILE, self.cars, "cars")
+                 # Calculate fingerprint from provided PEM
+                 fingerprint = self._calculate_fingerprint_from_pem(car_certificate_pem)
+                 if not fingerprint:
+                      response.update({"type": "REGISTER_CAR_NAK", "payload": {"error": "Invalid car certificate format provided"}})
+                 else:
+                     # Check if owner exists
+                     with self.user_lock:
+                        if owner_user_id not in self.users:
+                            response.update({"type": "REGISTER_CAR_NAK", "payload": {"error": f"Owner user '{owner_user_id}' not registered"}})
+                        else:
+                            # Proceed with registration
+                            with self.car_lock:
+                                logging.info(f"Registering car '{car_id}' with fingerprint: {fingerprint}")
+                                self.cars[car_id] = {
+                                    'owner_user_id': owner_user_id,
+                                    'model': model,
+                                    # Store the fingerprint, not the placeholder key or full cert
+                                    'certificate_fingerprint_sha256': fingerprint,
+                                    # Optionally store PEM if needed elsewhere, but fingerprint is key for validation
+                                    # 'certificate_pem': car_certificate_pem
+                                }
+                                # --- Need to save cars data ---
+                                cars_copy = self.cars.copy() # Create copy within lock
+                            # --- Save outside the lock ---
+                            self._save_json(config.CARS_FILE, cars_copy, "cars")
                         response.update({"type": "REGISTER_CAR_ACK", "payload": {"status": "OK", "car_id": car_id, "owner": owner_user_id}})
                         logging.info(f"Car '{car_id}' registered/updated for owner '{owner_user_id}'.")
 
@@ -290,7 +323,37 @@ class BackendServer:
                          self._save_json(config.DELEGATIONS_FILE, self.delegations, "delegations")
                          response.update({"type": "REVOKE_DELEGATION_ACK", "payload": {"status": "OK", "delegation_id": delegation_id}})
                          logging.info(f"Delegation '{delegation_id}' revoked by owner '{sender_id}'.")
+        
+        # --- NEW: Certificate Validation (Called by App Client) ---
+        elif msg_type == "VALIDATE_CAR_CERT":
+            # This request comes from the App Client (sender_id is user_id)
+            if not sender_id: return {"type": "ERROR", "payload": {"error": "Missing sender_id (user) for VALIDATE_CAR_CERT"}}
 
+            car_id_to_validate = payload.get('car_id')
+            received_fingerprint = payload.get('certificate_fingerprint')
+
+            if not car_id_to_validate or not received_fingerprint:
+                response.update({"type": "VALIDATE_CAR_CERT_NAK", "payload": {"error": "Missing car_id or certificate_fingerprint"}})
+            else:
+                with self.car_lock:
+                    car_data = self.cars.get(car_id_to_validate)
+
+                if not car_data:
+                    logging.warning(f"Validation failed: Car ID '{car_id_to_validate}' not found for user '{sender_id}'.")
+                    response.update({"type": "VALIDATE_CAR_CERT_NAK", "payload": {"car_id": car_id_to_validate, "status": "INVALID", "reason": "Car not registered"}})
+                else:
+                    expected_fingerprint = car_data.get('certificate_fingerprint_sha256')
+                    if not expected_fingerprint:
+                        # This shouldn't happen if registration is correct
+                        logging.error(f"Internal Error: Missing stored fingerprint for car '{car_id_to_validate}'.")
+                        response.update({"type": "VALIDATE_CAR_CERT_NAK", "payload": {"car_id": car_id_to_validate, "status": "INVALID", "reason": "Server internal error: fingerprint missing"}})
+                    elif received_fingerprint == expected_fingerprint:
+                        logging.info(f"Certificate validation SUCCESS for car '{car_id_to_validate}' requested by user '{sender_id}'. Fingerprint: {received_fingerprint}")
+                        response.update({"type": "VALIDATE_CAR_CERT_ACK", "payload": {"car_id": car_id_to_validate, "status": "VALID"}})
+                    else:
+                        logging.warning(f"Certificate validation FAILED for car '{car_id_to_validate}' requested by user '{sender_id}'. Expected: {expected_fingerprint}, Received: {received_fingerprint}")
+                        response.update({"type": "VALIDATE_CAR_CERT_NAK", "payload": {"car_id": car_id_to_validate, "status": "INVALID", "reason": "Certificate fingerprint mismatch"}})
+        
         # --- Access Validation (Called by Car Server) ---
         elif msg_type == "VALIDATE_ACCESS_ATTEMPT":
              # TODO (AUTH): Verify that this request genuinely came from the car identified by 'sender_id'.
