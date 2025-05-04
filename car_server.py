@@ -5,6 +5,11 @@ import logging
 import ssl # <-- Import ssl
 from utils import config, network_utils
 import os
+# --- Need cryptography for parsing cert and serializing key ---
+from cryptography import x509
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.backends import default_backend
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - CarServer [{car_id}] - %(threadName)s - %(levelname)s - %(message)s')
 
 class CarServer:
@@ -21,8 +26,11 @@ class CarServer:
         self.logger = logging.getLogger(__name__)
         self.logger_adapter = logging.LoggerAdapter(self.logger, {'car_id': self.car_id})
 
-          # --- TLS Setup ---
-        self.ssl_context = self._create_ssl_context()
+        # --- TLS Setup ---
+        # Context for incoming connections from AppClient
+        self.incoming_ssl_context = self._create_incoming_ssl_context() # Renamed
+        # NEW: Context for outgoing connections to BackendServer
+        self.outgoing_ssl_context = self._create_outgoing_ssl_context()
 
         # TODO (AUTH): Load car's private key securely (e.g., from file/secure element).
         self.car_private_key = None # Replace with actual key object
@@ -31,8 +39,8 @@ class CarServer:
         #   to allow offline verification or faster online verification.
         self.user_public_keys_cache = {} # Example: { 'user_id': loaded_public_key_object }
 
-    # --- New Method: Create SSL Context ---
-    def _create_ssl_context(self):
+    # ---  Create SSL Context for INCOMING connections ---
+    def _create_incoming_ssl_context(self):
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         try:
             self._log(logging.INFO, f"Loading CAR cert chain: {config.CAR_CERT_FILE}, {config.CAR_KEY_FILE}")
@@ -40,8 +48,10 @@ class CarServer:
 
             self._log(logging.INFO, f"Loading CA cert for client verification: {config.CA_CERT_FILE}")
             # Require client certificate and verify it against our CA
+            # Verify AppClient's cert using CA
             context.load_verify_locations(cafile=config.CA_CERT_FILE)
             context.verify_mode = ssl.CERT_REQUIRED
+            self._log(logging.INFO, "INCOMING SSL context created successfully for mTLS (Car <- App).")
 
             # Optional: Set specific TLS versions or cipher suites
             context.minimum_version = ssl.TLSVersion.TLSv1_3
@@ -56,29 +66,86 @@ class CarServer:
              self._log(logging.CRITICAL, f"Certificate file not found: {e}")
              raise SystemExit("Failed to initialize SSL context - certificate file missing.")
         except Exception as e:
-             self._log(logging.CRITICAL, f"Unexpected error creating SSL context: {e}")
-             raise SystemExit("Failed to initialize SSL context.")
-        
+             self._log(logging.CRITICAL, f"Unexpected error creating INCOMING SSL context: {e}")
+             raise SystemExit("Failed to initialize INCOMING SSL context.")
+
+
+     # --- Create SSL Context for OUTGOING connections ---
+    def _create_outgoing_ssl_context(self):
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        try:
+            self._log(logging.INFO, f"Loading CAR cert chain for backend auth: {config.CAR_CERT_FILE}, {config.CAR_KEY_FILE}")
+            # Uses CAR's cert/key TO authenticate itself TO BackendServer
+            context.load_cert_chain(certfile=config.CAR_CERT_FILE, keyfile=config.CAR_KEY_FILE)
+
+            self._log(logging.INFO, f"Loading CA cert for backend server verification: {config.CA_CERT_FILE}")
+            # Uses CA cert TO verify the BackendServer's certificate
+            context.load_verify_locations(cafile=config.CA_CERT_FILE)
+            context.verify_mode = ssl.CERT_REQUIRED
+
+            # Hostname checking for the backend server - IMPORTANT
+            context.check_hostname = False # Set True if backend server cert CN matches config.SERVER_IP/hostname
+            if not context.check_hostname:
+                 self._log(logging.WARNING, "SSL Hostname Check is DISABLED for Car->Backend connection.")
+
+            self._log(logging.INFO, "OUTGOING SSL context created successfully for mTLS (Car -> Backend).")
+            return context
+        except ssl.SSLError as e:
+            self._log(logging.CRITICAL, f"SSL Error creating outgoing client context for Car: {e}")
+            raise SystemExit("Failed to initialize outgoing Car SSL context.")
+        except FileNotFoundError as e:
+             self._log(logging.CRITICAL, f"Certificate file not found for outgoing Car context: {e}")
+             raise SystemExit("Failed to initialize outgoing Car SSL context.")
+        except Exception as e:
+             self._log(logging.CRITICAL, f"Unexpected error creating outgoing Car SSL context: {e}")
+             raise SystemExit("Failed to initialize outgoing Car SSL context.")
+
     def _log(self, level, msg, *args, **kwargs):
         """Helper for logging with car_id context."""
         self.logger_adapter.log(level, msg, *args, **kwargs)
 
     def _connect_to_backend(self):
         """Establishes a connection to the backend server."""
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.connect(self.backend_server_addr)
-            self._log(logging.DEBUG, f"Connected to backend server at {self.backend_server_addr}")
-            return sock
-        except socket.error as e:
-            self._log(logging.ERROR, f"Failed to connect to backend server {self.backend_server_addr}: {e}")
+
+        if not self.outgoing_ssl_context:
+            self._log(logging.ERROR, "Cannot connect to backend: Outgoing SSL context not initialized.")
             return None
+        
+        raw_sock = None
+        ssl_sock = None
+        address = self.backend_server_addr
+        try:
+            raw_sock = socket.create_connection(address, timeout=5.0)
+            server_hostname = address[0] if self.outgoing_ssl_context.check_hostname else None
+            # Use the outgoing context
+            ssl_sock = self.outgoing_ssl_context.wrap_socket(raw_sock, server_hostname=server_hostname)
+            self._log(logging.INFO, f"Secure TLS connection established to backend server {address}")
+            return ssl_sock # Return the secure socket
+        except socket.timeout:
+            self._log(logging.ERROR, f"Connection to backend server {address} timed out.")
+            if raw_sock: raw_sock.close()
+            return None
+        except socket.error as e:
+            self._log(logging.ERROR, f"Socket error connecting to backend {address}: {e}")
+            if raw_sock: raw_sock.close()
+            return None
+        except ssl.SSLError as e:
+             self._log(logging.ERROR, f"SSL Error establishing connection to backend {address}: {e}")
+             if ssl_sock: ssl_sock.close()
+             elif raw_sock: raw_sock.close()
+             return None
+        except Exception as e:
+             self._log(logging.ERROR, f"Unexpected error connecting to backend {address}: {e}")
+             if ssl_sock: ssl_sock.close()
+             elif raw_sock: raw_sock.close()
+             return None
 
     def _validate_action_with_server(self, requesting_user_id: str, action: str) -> bool:
         """Asks the backend server if the user is allowed to perform the action."""
-        self._log(logging.INFO, f"Validating action '{action}' for user '{requesting_user_id}' with backend server.")
-        backend_sock = self._connect_to_backend()
-        if not backend_sock:
+        self._log(logging.INFO, f"Validating action '{action}' for user '{requesting_user_id}' with backend server (using TLS).")
+        backend_tls_sock = self._connect_to_backend()
+        if not backend_tls_sock:
+            self._log(logging.ERROR,"Failed to establish secure connection to backend for validation.")
             return False # Cannot validate if connection fails
 
         validation_request = {
@@ -97,8 +164,10 @@ class CarServer:
 
         access_granted = False
         try:
-            if network_utils.send_message(backend_sock, validation_request):
-                response = network_utils.receive_message(backend_sock)
+            # --- Use the TLS socket ---
+            if network_utils.send_message(backend_tls_sock, validation_request):
+                backend_tls_sock.settimeout(5.0) # Set timeout on the TLS socket
+                response = network_utils.receive_message(backend_tls_sock)
                 # TODO (AUTH): Optionally verify signature on response from server.
 
                 if response and response.get("type") == "ACCESS_GRANTED":
@@ -111,21 +180,110 @@ class CarServer:
                      error_msg = response.get("payload", {}).get("error", "Unknown reason")
                      self._log(logging.WARNING, f"Server DENIED access for '{requesting_user_id}' to perform '{action}'. Reason: {error_msg}")
                 else:
-                     self._log(logging.ERROR, "No valid response received from backend server during validation.")
+                     # Log error already happened in receive_message
+                     self._log(logging.ERROR, "No valid response received from backend server during validation (TLS).")
             else:
-                 self._log(logging.ERROR, "Failed to send validation request to backend server.")
+                 # Log error already happened in send_message
+                 self._log(logging.ERROR, "Failed to send validation request to backend server (TLS).")
+        # --- Catch SSL errors during communication ---
+        except ssl.SSLError as e:
+             self._log(logging.ERROR, f"SSL error during validation communication with backend: {e}")
         except Exception as e:
              self._log(logging.ERROR, f"Error during validation communication with backend: {e}")
         finally:
-            self._log(logging.DEBUG, f"Closing connection to backend server after validation.")
-            backend_sock.close()
+            if backend_tls_sock:
+                self._log(logging.DEBUG, f"Closing TLS connection to backend server after validation.")
+                try:
+                    backend_tls_sock.shutdown(socket.SHUT_RDWR)
+                except OSError: pass
+                backend_tls_sock.close()
 
         return access_granted
+
+    # --- Helper Method: Validate App Public Key with Backend ---
+    def _validate_app_pubkey_with_server(self, app_public_key_pem: str, user_id: str) -> bool:
+        """Contacts the backend server securely (TLS) to validate the app's public key PEM for the given user."""
+        if not app_public_key_pem or not user_id:
+            self._log(logging.ERROR, "App public key PEM or User ID missing for validation call.")
+            return False
+
+        self._log(logging.INFO, f"Validating app public key for user '{user_id}' with backend.")
+        validation_message = {
+            "type": "VALIDATE_APP_PUBKEY", # New message type
+            "sender_id": self.car_id,
+            "payload": {
+                "user_id_to_validate": user_id,
+                "app_public_key_pem": app_public_key_pem
+            }
+        }
+
+        backend_tls_sock = None
+        try:
+            backend_tls_sock = self._connect_to_backend() # Connect securely
+            if not backend_tls_sock:
+                self._log(logging.ERROR,"Failed to connect to backend for app pubkey validation.")
+                return False
+
+            if network_utils.send_message(backend_tls_sock, validation_message):
+                backend_tls_sock.settimeout(5.0)
+                response = network_utils.receive_message(backend_tls_sock)
+                if response and response.get("type") == "VALIDATE_APP_PUBKEY_ACK" and response.get("payload", {}).get("status") == "VALID":
+                    self._log(logging.INFO, f"Backend validation SUCCESS for app public key (User: {user_id}).")
+                    return True
+                else:
+                    reason = response.get("payload", {}).get("reason", "Unknown") if response else "No response"
+                    self._log(logging.WARNING, f"Backend validation FAILED for app public key (User: {user_id}): {reason}")
+                    return False
+            else:
+                self._log(logging.ERROR,"Failed to send app pubkey validation request to backend.")
+                return False
+        # ... (keep exception handling: timeout, ssl error, generic error) ...
+        # --- Catch SSL errors during communication ---
+        except socket.timeout:
+            self._log(logging.ERROR, f"Connection to backend server timed out.")
+        except ssl.SSLError as e:
+             self._log(logging.ERROR, f"SSL error during validation communication with backend: {e}")
+        except Exception as e:
+             self._log(logging.ERROR, f"Error during validation communication with backend: {e}")
+        finally:
+             if backend_tls_sock:
+                 self._log(logging.DEBUG,"Closing backend connection after app pubkey validation.")
+                 try: backend_tls_sock.shutdown(socket.SHUT_RDWR)
+                 except OSError: pass
+                 backend_tls_sock.close()
 
 
     def handle_client(self, ssl_client_socket: ssl.SSLSocket, address): # <-- Takes SSLSocket now
         threading.current_thread().name = f"App-{address[0]}:{address[1]}"
         self._log(logging.INFO, f"TLS connection established with {address}")
+
+        app_public_key_pem = None # Store PEM string now
+
+        try:
+            # Get app certificate in DER format
+            app_cert_der = ssl_client_socket.getpeercert(binary_form=True)
+            if not app_cert_der:
+                 raise ValueError("Could not get peer certificate (app) in binary form.")
+
+            # Parse DER cert, extract public key, serialize to PEM
+            app_cert = x509.load_der_x509_certificate(app_cert_der, default_backend())
+            public_key = app_cert.public_key()
+            app_public_key_pem = public_key.public_bytes(
+                 encoding=serialization.Encoding.PEM,
+                 format=serialization.PublicFormat.SubjectPublicKeyInfo
+            ).decode('utf-8') # Decode to string
+
+            self._log(logging.INFO, f"App public key PEM extracted:\n{app_public_key_pem[:80]}...")
+        except (ValueError, TypeError, ssl.SSLError) as e: # Catch parsing/serialization errors
+             self._log(logging.ERROR, f"Failed to get or process app certificate/key from {address}: {e}. Closing connection.")
+             try: ssl_client_socket.close()
+             except Exception: pass
+             return # Abort handling
+        except Exception as e: # Catch other unexpected errors
+            self._log(logging.ERROR, f"Unexpected error getting app pubkey from {address}: {e}. Closing connection.")
+            try: ssl_client_socket.close()
+            except Exception: pass
+            return # Abort handling
 
         # --- Log Client Cert Info (Optional Debugging) ---
         try:
@@ -149,8 +307,9 @@ class CarServer:
                 if message is None:
                     break
 
-                response = self.process_message(message) # Process logic remains the same
-
+                # --- Pass message AND public key PEM to process_message ---
+                response = self.process_message(message, app_public_key_pem, ssl_client_socket)
+                
                 if response:
                     # Send response over the SSL socket
                     if not network_utils.send_message(ssl_client_socket, response):
@@ -170,10 +329,10 @@ class CarServer:
                 pass # Ignore if already closed
             ssl_client_socket.close()
 
-    def process_message(self, message: dict) -> dict | None:
+    def process_message(self, message: dict, app_public_key_pem: str, ssl_sock: ssl.SSLSocket) -> dict | None:        
         msg_type = message.get('type')
         # This is the user interacting with the car via the app
-        requesting_user_id = message.get('sender_id')
+        requesting_user_id = message.get('sender_id')        
         payload = message.get('payload', {}) # Use if needed
         # TODO (AUTH): Extract signature/auth_data from payload.
         #   auth_data = payload.get('auth_data') # Could be signature or signed nonce
@@ -184,6 +343,17 @@ class CarServer:
 
         self._log(logging.INFO, f"Processing message type '{msg_type}' from user '{requesting_user_id}'")
 
+        # ---=== Step 1: Validate App Public Key against User ID ===---
+        if not self._validate_app_pubkey_with_server(app_public_key_pem, requesting_user_id): # Call new validator
+             # Validation failed! Logged in helper function.
+             self._log(logging.WARNING, f"Authentication failed for user '{requesting_user_id}' due to app public key mismatch.")
+             nak_type = "ERROR"
+             if msg_type.endswith("_REQUEST"): nak_type = msg_type.replace("_REQUEST", "_NAK")
+             return {"type": nak_type, "sender_id": self.car_id, "payload": {"error": "Authentication failed"}}
+        # ---=== Validation Successful ===---
+
+
+        # --- Step 2: Proceed with message processing (permission checks, etc.) ---
         response = {"sender_id": self.car_id}
 
         # --- Helper for App Signature Verification ---
@@ -268,8 +438,9 @@ class CarServer:
         return response
 
     def start(self):
-        if not self.ssl_context: # Check if context creation failed
-            self._log(logging.CRITICAL, "Cannot start server without a valid SSL context.")
+        # Check both contexts now
+        if not self.incoming_ssl_context or not self.outgoing_ssl_context:
+            self._log(logging.CRITICAL, "Cannot start car server without valid SSL contexts.")
             return
 
         try:
@@ -283,7 +454,7 @@ class CarServer:
                     self._log(logging.INFO, f"Incoming connection attempt from {address}")
                     # --- Wrap socket with SSL Context ---
                     try:
-                        ssl_sock = self.ssl_context.wrap_socket(client_socket, server_side=True)
+                        ssl_sock = self.incoming_ssl_context.wrap_socket(client_socket, server_side=True)
                         self._log(logging.DEBUG, f"SSL handshake initiated with {address}")
                         # Handshake happens implicitly here or on first read/write
                         # You could explicitly call ssl_sock.do_handshake() if needed, but it's often automatic.
@@ -293,12 +464,11 @@ class CarServer:
                         client_thread.name = f"Handler-{address[0]}:{address[1]}"
                         client_thread.start()
                     except ssl.SSLError as e:
-                         self._log(logging.ERROR, f"SSL Handshake failed with {address}: {e}. Closing raw socket.")
-                         client_socket.close() # Close the underlying socket if handshake fails
+                         self._log(logging.ERROR, f"Car SSL Handshake failed with {address}: {e}. Closing raw socket.")
+                         client_socket.close()
                     except Exception as e:
                         self._log(logging.ERROR, f"Error wrapping socket or starting thread for {address}: {e}")
                         client_socket.close()
-                    # ----------------------------------
 
                  except KeyboardInterrupt:
                      self._log(logging.INFO, "Shutdown signal received.")

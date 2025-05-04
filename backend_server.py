@@ -6,9 +6,20 @@ import logging
 import os
 import time
 import uuid # For unique delegation IDs
-from utils import config, network_utils
+import hashlib
+import ssl # <-- Import ssl
+import hmac # <-- Add hmac for secure comparison
+from cryptography import x509 # <-- Add cryptography
+from cryptography.hazmat.primitives import hashes as crypto_hashes # <-- Add cryptography hashes
+from cryptography.hazmat.backends import default_backend # <-- Add cryptography backend
+from cryptography.hazmat.primitives import serialization
+from utils import config, network_utils 
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - Server - %(threadName)s - %(levelname)s - %(message)s')
+
+# --- Hashing constants ---
+SALT_BYTES = 16
+HASH_ALGORITHM = 'sha256'
 
 class BackendServer:
     def __init__(self, host, port):
@@ -27,8 +38,70 @@ class BackendServer:
         self.car_lock = threading.Lock()
         self.delegation_lock = threading.Lock()
 
+        # --- TLS Setup for Backend Server ---
+        self.server_ssl_context = self._create_server_ssl_context()
+
         # Load initial data
         self.load_data()
+
+     # --- Hashing Helper Functions ---
+    def _generate_salt(self) -> bytes:
+        return os.urandom(SALT_BYTES)
+
+    def _hash_pin(self, pin: str, salt: bytes) -> str:
+        """Hashes the PIN with the given salt."""
+        if not isinstance(pin, str): pin = str(pin) # Ensure pin is string
+        hasher = hashlib.new(HASH_ALGORITHM)
+        hasher.update(salt)
+        hasher.update(pin.encode('utf-8'))
+        return hasher.hexdigest()
+
+    def _verify_pin(self, user_id: str, provided_pin: str) -> bool:
+        """Verifies the provided PIN against the stored hash for the user."""
+        with self.user_lock:
+            user_data = self.users.get(user_id)
+
+        if not user_data or 'pin_salt' not in user_data or 'pin_hash' not in user_data:
+            logging.warning(f"PIN verification attempt for non-existent or incomplete user: {user_id}")
+            return False
+
+        try:
+            salt = bytes.fromhex(user_data['pin_salt'])
+            stored_hash = user_data['pin_hash']
+            provided_hash = self._hash_pin(provided_pin, salt)
+
+            # Use hmac.compare_digest for timing-attack resistance
+            return hmac.compare_digest(stored_hash, provided_hash)
+        except (ValueError, TypeError) as e:
+            logging.error(f"Error during PIN verification for {user_id}: {e}")
+            return False
+
+     # --- Create Backend Server SSL Context ---
+    def _create_server_ssl_context(self):
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        try:
+            logging.info(f"Loading SERVER cert chain: {config.SERVER_CERT_FILE}, {config.SERVER_KEY_FILE}")
+            context.load_cert_chain(certfile=config.SERVER_CERT_FILE, keyfile=config.SERVER_KEY_FILE)
+            
+            logging.info(f"Loading CA cert for client (app) verification: {config.CA_CERT_FILE}")
+            # Require client certificate and verify it against our CA
+            context.load_verify_locations(cafile=config.CA_CERT_FILE)
+            context.verify_mode = ssl.CERT_REQUIRED # Require app client cert
+
+            # Optional: Set specific TLS versions or cipher suites
+            # context.minimum_version = ssl.TLSVersion.TLSv1_3
+
+            logging.info("Backend Server SSL context created successfully for mTLS.")
+            return context
+        except ssl.SSLError as e:
+            logging.critical(f"SSL Error creating backend server context: {e}")
+            raise SystemExit("Failed to initialize backend SSL context - check certificate paths/permissions.")
+        except FileNotFoundError as e:
+             logging.critical(f"Certificate file not found for backend server: {e}")
+             raise SystemExit("Failed to initialize backend SSL context - certificate file missing.")
+        except Exception as e:
+             logging.critical(f"Unexpected error creating backend SSL context: {e}")
+             raise SystemExit("Failed to initialize backend SSL context.")
 
     def load_data(self):
         """Loads all data from JSON files."""
@@ -82,34 +155,97 @@ class BackendServer:
         except Exception as e:
             logging.error(f"Unexpected error saving {description}: {e}")
 
-    def handle_client(self, client_socket: socket.socket, address):
+    def _calculate_fingerprint_from_pem(self, cert_pem: str) -> str | None:
+        """Calculates SHA-256 fingerprint of a certificate from PEM string."""
+        try:
+            # Load the certificate from PEM
+            cert = x509.load_pem_x509_certificate(cert_pem.encode('utf-8'), default_backend())
+            # Calculate SHA-256 hash of the DER encoded certificate
+            fingerprint_bytes = cert.fingerprint(crypto_hashes.SHA256())
+            return fingerprint_bytes.hex()
+        except ValueError as e:
+            logging.error(f"Failed to parse certificate PEM: {e}")
+            return None
+        except Exception as e:
+            logging.error(f"Error calculating certificate fingerprint: {e}")
+            return None
+
+    def handle_client(self, ssl_client_socket: ssl.SSLSocket, address): # <-- Takes SSLSocket
         # Assign a name to the thread for better logging
+        # NOTE: Communication with the app client for this validation should ideally ALSO use TLS.
+        # For simplicity here, we are assuming the channel is secure or accepting the risk for the POC.
+        # To add TLS here, you'd wrap client_socket similar to how the car server does.
         threading.current_thread().name = f"Client-{address[0]}:{address[1]}"
-        logging.info(f"Accepted connection from {address}")
+        logging.info(f"Accepted TLS connection from {address} (App Client)")
+
+        # --- Log Client Cert Info ---
+        try:
+            client_cert = ssl_client_socket.getpeercert()
+            if client_cert:
+                 subject = dict(x[0] for x in client_cert.get('subject', []))
+                 logging.debug(f"App Client Cert Subject: {subject}")
+            else:
+                 logging.warning("Could not get peer certificate details from App Client.")
+        except Exception as e:
+             logging.warning(f"Error getting peer certificate from App Client: {e}")
+
+        client_public_key_pem = None # Store extracted key for signup
+        try:
+            client_cert_der = ssl_client_socket.getpeercert(binary_form=True)
+            if client_cert_der:
+                client_cert = x509.load_der_x509_certificate(client_cert_der, default_backend())
+                public_key = client_cert.public_key()
+                client_public_key_pem = public_key.public_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PublicFormat.SubjectPublicKeyInfo
+                ).decode('utf-8')
+                logging.debug(f"Extracted App Client public key PEM for potential signup.")
+            else:
+                logging.warning(f"Could not get peer certificate from {address} to extract public key.")
+
+            # Log subject details
+            client_cert_details = ssl_client_socket.getpeercert()
+            if client_cert_details:
+                 subject = dict(x[0] for x in client_cert_details.get('subject', []))
+                 logging.debug(f"App Client Cert Subject: {subject}")
+
+        except Exception as e:
+             logging.warning(f"Error getting/processing peer certificate from App Client {address}: {e}")
+        # --- End Cert Info ---
+
         try:
             while True:
-                message = network_utils.receive_message(client_socket)
+                # Use the SSL socket for communication
+                message = network_utils.receive_message(ssl_client_socket)
                 if message is None:
-                    break
+                    break # Error or connection closed gracefully
 
-                response = self.process_message(message)
-
+                # Pass the extracted public key PEM to process_message if needed for signup
+                response = self.process_message(message, client_public_key_pem)
+                
                 if response:
-                    if not network_utils.send_message(client_socket, response):
-                         logging.warning(f"Failed to send response to {address}. Closing connection.")
+                    # Send response over the SSL socket
+                    if not network_utils.send_message(ssl_client_socket, response):
+                         logging.warning(f"Failed to send response to {address}. Closing TLS connection.")
                          break
         except ConnectionResetError:
              logging.info(f"Connection reset by peer {address}")
+        except ssl.SSLError as e:
+             logging.error(f"SSL Error during communication with App Client {address}: {e}")
         except Exception as e:
-            logging.error(f"Error handling client {address}: {e}")
+            logging.error(f"Error handling App Client {address}: {e}")
         finally:
-            logging.info(f"Closing connection from {address}")
-            client_socket.close()
+            logging.info(f"Closing TLS connection from App Client {address}")
+            try:
+                ssl_client_socket.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass # Ignore if already closed
+            ssl_client_socket.close()
 
-    def process_message(self, message: dict) -> dict | None:
+    def process_message(self, message: dict, client_public_key_pem: str | None = None) -> dict | None:
         """Processes incoming messages and returns a response dictionary or None."""
         msg_type = message.get('type')
-        sender_id = message.get('sender_id') # Could be user_id or car_id
+        #sender_id = message.get('sender_id') # Could be user_id or car_id
         payload = message.get('payload', {})
         # TODO (AUTH): Extract signature from message if present (e.g., signature = message.get('signature'))
 
@@ -117,7 +253,7 @@ class BackendServer:
             logging.warning(f"Received message with missing type: {message}")
             return {"type": "ERROR", "sender_id": "server", "payload": {"error": "Missing message type"}}
 
-        logging.info(f"Processing message type '{msg_type}' from '{sender_id or 'Unknown Sender'}'")
+        logging.info(f"Processing message type '{msg_type}' (Payload keys: {list(payload.keys())})")
 
         response = {"sender_id": "server"} # Base for most responses
         # --- Helper function for verification ---
@@ -131,31 +267,97 @@ class BackendServer:
             logging.warning(f"AUTH PLACEHOLDER: Signature verification for user '{user_id}' not implemented. Assuming valid.")
             return True # Placeholder - DANGER!
 
+        # --- NEW: User Signup ---
+        if msg_type == "SIGNUP":
+            user_id = payload.get('user_id')
+            pin = payload.get('pin')
+            # We get the public key from the TLS connection itself now
+            app_public_key_pem = client_public_key_pem
 
-        # --- User Management ---
-        if msg_type == "REGISTER":
-             # TODO (AUTH): If registration requires signing (e.g., during a pairing ceremony),
-             #   verify the signature here. For simple POC, maybe trust initial registration.
-             # NOTE (AUTH): Storing the ACTUAL public key (PEM/bytes) from payload is crucial.
+            if not user_id or not pin or not app_public_key_pem:
+                return {"type": "SIGNUP_NAK", "payload": {"error": "Missing user_id, pin, or could not get public key from certificate"}}
 
-             if not sender_id: return {"type": "ERROR", "payload": {"error": "Missing sender_id for REGISTER"}}
-             public_key = payload.get('public_key')
-             if not public_key:
-                  response.update({"type": "REGISTER_NAK", "payload": {"error": "Missing public key"}})
-             else:
-                 with self.user_lock:
-                     self.users[sender_id] = {'public_key': public_key, 'license_valid': True}
-                     self._save_json(config.REGISTRATION_FILE, self.users, "user registrations") # Save immediately
-                 response.update({"type": "REGISTER_ACK", "payload": {"status": "OK", "user_id": sender_id}})
-                 logging.info(f"User '{sender_id}' registered/updated successfully.")
+            if not isinstance(pin, str) or not pin.isdigit() or len(pin) != 4:
+                 return {"type": "SIGNUP_NAK", "payload": {"error": "PIN must be a 4-digit number"}}
 
+            with self.user_lock:
+                if user_id in self.users:
+                    return {"type": "SIGNUP_NAK", "payload": {"error": "User ID already exists"}}
+                else:
+                    salt = self._generate_salt()
+                    pin_hash = self._hash_pin(pin, salt)
+                    self.users[user_id] = {
+                        'public_key_pem': app_public_key_pem,
+                        'pin_salt': salt.hex(), # Store salt as hex string
+                        'pin_hash': pin_hash,
+                        'license_valid': True # Default license to valid on signup
+                    }
+                    users_copy = self.users.copy() # Make copy inside lock
+            # Save outside lock
+            self._save_json(config.REGISTRATION_FILE, users_copy, "user registrations")
+            logging.info(f"User '{user_id}' signed up successfully.")
+            response.update({"type": "SIGNUP_ACK", "payload": {"status": "OK", "user_id": user_id}})
+
+        # --- NEW: User Login ---
+        elif msg_type == "LOGIN":
+            user_id = payload.get('user_id')
+            pin = payload.get('pin')
+
+            if not user_id or not pin:
+                return {"type": "LOGIN_NAK", "payload": {"error": "Missing user_id or pin"}}
+
+            if not isinstance(pin, str) or not pin.isdigit() or len(pin) != 4:
+                 return {"type": "LOGIN_NAK", "payload": {"error": "PIN must be a 4-digit number"}}
+
+            if self._verify_pin(user_id, pin):
+                logging.info(f"User '{user_id}' logged in successfully.")
+                # Optionally fetch license status to send back
+                with self.user_lock:
+                    license_valid = self.users.get(user_id, {}).get('license_valid', False)
+                response.update({"type": "LOGIN_ACK", "payload": {"status": "OK", "user_id": user_id, "license_valid": license_valid}})
+            else:
+                logging.warning(f"Login failed for user '{user_id}' (Invalid PIN or user not found).")
+                # Avoid distinguishing between user not found and bad PIN for security
+                response.update({"type": "LOGIN_NAK", "payload": {"error": "Invalid user ID or PIN"}})
+        
+        # --- REMOVED/REPLACED: Original REGISTER ---
+        
+        # The functionality is now handled by SIGNUP
+        # # --- User Management ---
+        # if msg_type == "REGISTER":
+        #      # TODO (AUTH): If registration requires signing (e.g., during a pairing ceremony),
+        #      #   verify the signature here. For simple POC, maybe trust initial registration.
+        #      # NOTE (AUTH): Storing the ACTUAL public key (PEM/bytes) from payload is crucial.
+
+        #      if not sender_id: return {"type": "ERROR", "payload": {"error": "Missing sender_id for REGISTER"}}
+             
+        #       # --- Expect the app's PUBLIC KEY PEM ---
+        #      app_public_key_pem = payload.get('app_public_key_pem')
+        #      if not app_public_key_pem:
+        #           response.update({"type": "REGISTER_NAK", "payload": {"error": "Missing app_public_key_pem"}})
+        #      # --- Basic PEM format check (optional but good) ---
+        #      elif not isinstance(app_public_key_pem, str) or not app_public_key_pem.startswith("-----BEGIN PUBLIC KEY-----"):
+        #          response.update({"type": "REGISTER_NAK", "payload": {"error": "Invalid app public key format provided (expecting PEM)"}})
+        #      else:
+        #          with self.user_lock:
+        #              logging.info(f"Registering user '{sender_id}' with public key:\n{app_public_key_pem[:80]}...") # Log start
+        #              self.users[sender_id] = {
+        #                  # Store public key PEM directly
+        #                  'public_key_pem': app_public_key_pem,
+        #                  'license_valid': True
+        #              }
+        #              users_copy = self.users.copy()
+        #          self._save_json(config.REGISTRATION_FILE, users_copy, "user registrations")
+        #          response.update({"type": "REGISTER_ACK", "payload": {"status": "OK", "user_id": sender_id}})
+        #          logging.info(f"User '{sender_id}' registered/updated successfully.")
+        
         elif msg_type == "CHECK_LICENSE":
             # TODO (AUTH): Verify signature from 'sender_id' on the payload/message content.
             # signature = message.get('signature')
             # data_signed = json.dumps(payload) # Or however the app signs it
             # if not verify_user_signature(sender_id, data_signed, signature):
             #     return {"type": "ERROR", "payload": {"error": "Invalid signature"}}
-
+             sender_id = message.get('sender_id') # Get sender_id from message now
              if not sender_id: return {"type": "ERROR", "payload": {"error": "Missing sender_id for CHECK_LICENSE"}}
              with self.user_lock:
                  user_data = self.users.get(sender_id)
@@ -172,31 +374,46 @@ class BackendServer:
             # signature = message.get('signature')
             # data_signed = json.dumps(payload)
             # if not verify_user_signature(sender_id, data_signed, signature):
-
+            
+            sender_id = message.get('sender_id') # Get sender_id from message
+            if not sender_id: return {"type": "ERROR", "payload": {"error": "Missing sender_id for REGISTER_CAR"}}
             # In POC, any registered user can register a car. In reality, needs admin/verification.
             car_id = payload.get('car_id')
             owner_user_id = payload.get('owner_user_id')
-            car_public_key = payload.get('car_public_key', "placeholder_car_key") # Optional
+            # --- Expect the full certificate PEM now ---
+            car_certificate_pem = payload.get('car_certificate_pem')
             model = payload.get('model', "Unknown Model")
 
-            if not car_id or not owner_user_id:
-                 response.update({"type": "REGISTER_CAR_NAK", "payload": {"error": "Missing car_id or owner_user_id"}})
+            if not car_id or not owner_user_id or not car_certificate_pem:
+                  response.update({"type": "REGISTER_CAR_NAK", "payload": {"error": "Missing car_id, owner_user_id, or car_certificate_pem"}})
+            elif sender_id != owner_user_id: # Ensure the authenticated user is the one claiming ownership
+                  response.update({"type": "REGISTER_CAR_NAK", "payload": {"error": f"Authenticated user '{sender_id}' does not match owner '{owner_user_id}'"}})
             else:
-                 # Check if owner exists
-                 with self.user_lock:
-                    if owner_user_id not in self.users:
-                        response.update({"type": "REGISTER_CAR_NAK", "payload": {"error": f"Owner user '{owner_user_id}' not registered"}})
-                    else:
-                        # Proceed with registration
-                        with self.car_lock:
-                            if car_id in self.cars:
-                                logging.warning(f"Car '{car_id}' already registered. Updating owner/details.")
-                            self.cars[car_id] = {
-                                'owner_user_id': owner_user_id,
-                                'car_public_key': car_public_key,
-                                'model': model
-                            }
-                            self._save_json(config.CARS_FILE, self.cars, "cars")
+                 # Calculate fingerprint from provided PEM
+                 fingerprint = self._calculate_fingerprint_from_pem(car_certificate_pem)
+                 if not fingerprint:
+                      response.update({"type": "REGISTER_CAR_NAK", "payload": {"error": "Invalid car certificate format provided"}})
+                 else:
+                     # Check if owner exists
+                     with self.user_lock:
+                        if owner_user_id not in self.users:
+                            response.update({"type": "REGISTER_CAR_NAK", "payload": {"error": f"Owner user '{owner_user_id}' not registered"}})
+                        else:
+                            # Proceed with registration
+                            with self.car_lock:
+                                logging.info(f"Registering car '{car_id}' with fingerprint: {fingerprint}")
+                                self.cars[car_id] = {
+                                    'owner_user_id': owner_user_id,
+                                    'model': model,
+                                    # Store the fingerprint, not the placeholder key or full cert
+                                    'certificate_fingerprint_sha256': fingerprint,
+                                    # Optionally store PEM if needed elsewhere, but fingerprint is key for validation
+                                    # 'certificate_pem': car_certificate_pem
+                                }
+                                # --- Need to save cars data ---
+                                cars_copy = self.cars.copy() # Create copy within lock
+                            # --- Save outside the lock ---
+                            self._save_json(config.CARS_FILE, cars_copy, "cars")
                         response.update({"type": "REGISTER_CAR_ACK", "payload": {"status": "OK", "car_id": car_id, "owner": owner_user_id}})
                         logging.info(f"Car '{car_id}' registered/updated for owner '{owner_user_id}'.")
 
@@ -207,7 +424,7 @@ class BackendServer:
             # data_signed = json.dumps(payload)
             # if not verify_user_signature(sender_id, data_signed, signature):
             #     return {"type": "DELEGATE_NAK", "payload": {"error": "Invalid signature for delegation"}}
-
+            sender_id = message.get('sender_id') # Owner performing delegation
             # sender_id here MUST be the owner initiating the delegation
             if not sender_id: return {"type": "ERROR", "payload": {"error": "Missing sender_id (owner) for DELEGATE_ACCESS"}}
             car_id = payload.get('car_id')
@@ -270,7 +487,7 @@ class BackendServer:
              # data_signed = json.dumps(payload)
              # if not verify_user_signature(sender_id, data_signed, signature):
              #     return {"type": "REVOKE_DELEGATION_NAK", "payload": {"error": "Invalid signature for revocation"}}
-
+             sender_id = message.get('sender_id') # Owner performing delegation
              # sender_id MUST be the owner
              if not sender_id: return {"type": "ERROR", "payload": {"error": "Missing sender_id (owner) for REVOKE_DELEGATION"}}
              delegation_id = payload.get('delegation_id')
@@ -290,6 +507,72 @@ class BackendServer:
                          self._save_json(config.DELEGATIONS_FILE, self.delegations, "delegations")
                          response.update({"type": "REVOKE_DELEGATION_ACK", "payload": {"status": "OK", "delegation_id": delegation_id}})
                          logging.info(f"Delegation '{delegation_id}' revoked by owner '{sender_id}'.")
+        
+        # --- NEW: Certificate Validation (Called by App Client) ---
+        elif msg_type == "VALIDATE_CAR_CERT":
+            sender_id = message.get('sender_id') # Owner performing delegation
+
+            # This request comes from the App Client (sender_id is user_id)
+            if not sender_id: return {"type": "ERROR", "payload": {"error": "Missing sender_id (user) for VALIDATE_CAR_CERT"}}
+
+            car_id_to_validate = payload.get('car_id')
+            received_fingerprint = payload.get('certificate_fingerprint')
+
+            if not car_id_to_validate or not received_fingerprint:
+                response.update({"type": "VALIDATE_CAR_CERT_NAK", "payload": {"error": "Missing car_id or certificate_fingerprint"}})
+            else:
+                with self.car_lock:
+                    car_data = self.cars.get(car_id_to_validate)
+
+                if not car_data:
+                    logging.warning(f"Validation failed: Car ID '{car_id_to_validate}' not found for user '{sender_id}'.")
+                    response.update({"type": "VALIDATE_CAR_CERT_NAK", "payload": {"car_id": car_id_to_validate, "status": "INVALID", "reason": "Car not registered"}})
+                else:
+                    expected_fingerprint = car_data.get('certificate_fingerprint_sha256')
+                    if not expected_fingerprint:
+                        # This shouldn't happen if registration is correct
+                        logging.error(f"Internal Error: Missing stored fingerprint for car '{car_id_to_validate}'.")
+                        response.update({"type": "VALIDATE_CAR_CERT_NAK", "payload": {"car_id": car_id_to_validate, "status": "INVALID", "reason": "Server internal error: fingerprint missing"}})
+                    elif received_fingerprint == expected_fingerprint:
+                        logging.info(f"Certificate validation SUCCESS for car '{car_id_to_validate}' requested by user '{sender_id}'. Fingerprint: {received_fingerprint}")
+                        response.update({"type": "VALIDATE_CAR_CERT_ACK", "payload": {"car_id": car_id_to_validate, "status": "VALID"}})
+                    else:
+                        logging.warning(f"Certificate validation FAILED for car '{car_id_to_validate}' requested by user '{sender_id}'. Expected: {expected_fingerprint}, Received: {received_fingerprint}")
+                        response.update({"type": "VALIDATE_CAR_CERT_NAK", "payload": {"car_id": car_id_to_validate, "status": "INVALID", "reason": "Certificate fingerprint mismatch"}})
+        
+
+        # --- App Public Key Validation (Called by Car Server) ---
+        elif msg_type == "VALIDATE_APP_PUBKEY": # New message type
+            sender_id = message.get('sender_id') # Owner performing delegation
+
+            # Request from Car Server (sender_id is car_id)
+            if not sender_id: return {"type": "ERROR", "payload": {"error": "Missing sender_id (car) for VALIDATE_APP_PUBKEY"}}
+
+            user_id_to_validate = payload.get('user_id_to_validate')
+            received_app_pubkey_pem = payload.get('app_public_key_pem')
+
+            if not user_id_to_validate or not received_app_pubkey_pem:
+                response.update({"type": "VALIDATE_APP_PUBKEY_NAK", "payload": {"error": "Missing user_id_to_validate or app_public_key_pem"}})
+            else:
+                with self.user_lock:
+                    user_data = self.users.get(user_id_to_validate)
+
+                if not user_data:
+                    logging.warning(f"App PubKey Validation failed: User ID '{user_id_to_validate}' not found (req by car '{sender_id}').")
+                    response.update({"type": "VALIDATE_APP_PUBKEY_NAK", "payload": {"user_id": user_id_to_validate, "status": "INVALID", "reason": "User not registered"}})
+                else:
+                    expected_pubkey_pem = user_data.get('public_key_pem')
+                    if not expected_pubkey_pem:
+                        logging.error(f"Internal Error: Missing stored public key PEM for user '{user_id_to_validate}'.")
+                        response.update({"type": "VALIDATE_APP_PUBKEY_NAK", "payload": {"user_id": user_id_to_validate, "status": "INVALID", "reason": "Server internal error: user public key missing"}})
+                    # --- Direct String Comparison of PEMs ---
+                    elif received_app_pubkey_pem == expected_pubkey_pem:
+                        logging.info(f"App public key validation SUCCESS for user '{user_id_to_validate}' requested by car '{sender_id}'.")
+                        response.update({"type": "VALIDATE_APP_PUBKEY_ACK", "payload": {"user_id": user_id_to_validate, "status": "VALID"}})
+                    else:
+                        logging.warning(f"App public key validation FAILED for user '{user_id_to_validate}' requested by car '{sender_id}'. Keys do not match.")
+                        # Don't log the keys themselves unless debugging heavily
+                        response.update({"type": "VALIDATE_APP_PUBKEY_NAK", "payload": {"user_id": user_id_to_validate, "status": "INVALID", "reason": "App public key mismatch"}})
 
         # --- Access Validation (Called by Car Server) ---
         elif msg_type == "VALIDATE_ACCESS_ATTEMPT":
@@ -304,6 +587,9 @@ class BackendServer:
              requesting_user_id = payload.get('requesting_user_id')
              car_id = payload.get('car_id') # Car should know its own ID, but client sends it for verification
              requested_action = payload.get('requested_action') # e.g., "UNLOCK", "START"
+             car_id_sender = message.get('sender_id') # Car sending the request
+
+             if not car_id_sender: return {"type": "ERROR", "payload": {"error": "Missing sender_id (car) for VALIDATE_ACCESS_ATTEMPT"}}
 
              if not requesting_user_id or not car_id or not requested_action:
                    response.update({"type": "ACCESS_DENIED", "payload": {"error": "Incomplete validation request"}})
@@ -382,24 +668,42 @@ class BackendServer:
 
         # --- Unknown Message Type ---
         else:
-            logging.warning(f"Received unknown message type '{msg_type}' from {sender_id or 'Unknown Sender'}")
+            lsender_id = message.get('sender_id', 'Unknown') # Attempt to get sender ID for logging
+            logging.warning(f"Received unknown message type '{msg_type}' from {sender_id}")
             response.update({"type": "ERROR", "payload": {"error": f"Unknown message type: {msg_type}"}})
 
         return response
 
     def start(self):
+        if not self.server_ssl_context: # Check if context creation failed
+            logging.critical("Cannot start backend server without a valid SSL context.")
+            return
+
         try:
             self.server_socket.bind((self.host, self.port))
             self.server_socket.listen(5)
-            logging.info(f"Backend server listening on {self.host}:{self.port}")
+            logging.info(f"Backend server listening securely (TLS) on {self.host}:{self.port}")
 
             while True:
                 try:
                     client_socket, address = self.server_socket.accept()
-                    client_thread = threading.Thread(target=self.handle_client, args=(client_socket, address), daemon=True)
-                    # Naming the thread helps debugging logs
-                    client_thread.name = f"Handler-{address[0]}:{address[1]}"
-                    client_thread.start()
+                    logging.info(f"Incoming connection attempt from {address}")
+                    # --- Wrap socket with Backend Server SSL Context ---
+                    try:
+                        # Use the server_ssl_context here
+                        ssl_sock = self.server_ssl_context.wrap_socket(client_socket, server_side=True)
+                        logging.debug(f"Backend SSL handshake initiated with {address}")
+
+                        # Pass the secure socket to the handler thread
+                        client_thread = threading.Thread(target=self.handle_client, args=(ssl_sock, address), daemon=True)
+                        client_thread.name = f"Handler-{address[0]}:{address[1]}"
+                        client_thread.start()
+                    except ssl.SSLError as e:
+                         logging.error(f"Backend SSL Handshake failed with {address}: {e}. Closing raw socket.")
+                         client_socket.close()
+                    except Exception as e:
+                        logging.error(f"Error wrapping socket or starting thread for backend connection {address}: {e}")
+                        client_socket.close()
                 except KeyboardInterrupt:
                      logging.info("Shutdown signal received.")
                      break
