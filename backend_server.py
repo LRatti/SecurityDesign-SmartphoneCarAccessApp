@@ -212,13 +212,24 @@ class BackendServer:
              # NOTE (AUTH): Storing the ACTUAL public key (PEM/bytes) from payload is crucial.
 
              if not sender_id: return {"type": "ERROR", "payload": {"error": "Missing sender_id for REGISTER"}}
-             public_key = payload.get('public_key')
-             if not public_key:
-                  response.update({"type": "REGISTER_NAK", "payload": {"error": "Missing public key"}})
+             
+              # --- Expect the app's PUBLIC KEY PEM ---
+             app_public_key_pem = payload.get('app_public_key_pem')
+             if not app_public_key_pem:
+                  response.update({"type": "REGISTER_NAK", "payload": {"error": "Missing app_public_key_pem"}})
+             # --- Basic PEM format check (optional but good) ---
+             elif not isinstance(app_public_key_pem, str) or not app_public_key_pem.startswith("-----BEGIN PUBLIC KEY-----"):
+                 response.update({"type": "REGISTER_NAK", "payload": {"error": "Invalid app public key format provided (expecting PEM)"}})
              else:
                  with self.user_lock:
-                     self.users[sender_id] = {'public_key': public_key, 'license_valid': True}
-                     self._save_json(config.REGISTRATION_FILE, self.users, "user registrations") # Save immediately
+                     logging.info(f"Registering user '{sender_id}' with public key:\n{app_public_key_pem[:80]}...") # Log start
+                     self.users[sender_id] = {
+                         # Store public key PEM directly
+                         'public_key_pem': app_public_key_pem,
+                         'license_valid': True
+                     }
+                     users_copy = self.users.copy()
+                 self._save_json(config.REGISTRATION_FILE, users_copy, "user registrations")
                  response.update({"type": "REGISTER_ACK", "payload": {"status": "OK", "user_id": sender_id}})
                  logging.info(f"User '{sender_id}' registered/updated successfully.")
 
@@ -405,6 +416,38 @@ class BackendServer:
                         logging.warning(f"Certificate validation FAILED for car '{car_id_to_validate}' requested by user '{sender_id}'. Expected: {expected_fingerprint}, Received: {received_fingerprint}")
                         response.update({"type": "VALIDATE_CAR_CERT_NAK", "payload": {"car_id": car_id_to_validate, "status": "INVALID", "reason": "Certificate fingerprint mismatch"}})
         
+
+        # --- App Public Key Validation (Called by Car Server) ---
+        elif msg_type == "VALIDATE_APP_PUBKEY": # New message type
+            # Request from Car Server (sender_id is car_id)
+            if not sender_id: return {"type": "ERROR", "payload": {"error": "Missing sender_id (car) for VALIDATE_APP_PUBKEY"}}
+
+            user_id_to_validate = payload.get('user_id_to_validate')
+            received_app_pubkey_pem = payload.get('app_public_key_pem')
+
+            if not user_id_to_validate or not received_app_pubkey_pem:
+                response.update({"type": "VALIDATE_APP_PUBKEY_NAK", "payload": {"error": "Missing user_id_to_validate or app_public_key_pem"}})
+            else:
+                with self.user_lock:
+                    user_data = self.users.get(user_id_to_validate)
+
+                if not user_data:
+                    logging.warning(f"App PubKey Validation failed: User ID '{user_id_to_validate}' not found (req by car '{sender_id}').")
+                    response.update({"type": "VALIDATE_APP_PUBKEY_NAK", "payload": {"user_id": user_id_to_validate, "status": "INVALID", "reason": "User not registered"}})
+                else:
+                    expected_pubkey_pem = user_data.get('public_key_pem')
+                    if not expected_pubkey_pem:
+                        logging.error(f"Internal Error: Missing stored public key PEM for user '{user_id_to_validate}'.")
+                        response.update({"type": "VALIDATE_APP_PUBKEY_NAK", "payload": {"user_id": user_id_to_validate, "status": "INVALID", "reason": "Server internal error: user public key missing"}})
+                    # --- Direct String Comparison of PEMs ---
+                    elif received_app_pubkey_pem == expected_pubkey_pem:
+                        logging.info(f"App public key validation SUCCESS for user '{user_id_to_validate}' requested by car '{sender_id}'.")
+                        response.update({"type": "VALIDATE_APP_PUBKEY_ACK", "payload": {"user_id": user_id_to_validate, "status": "VALID"}})
+                    else:
+                        logging.warning(f"App public key validation FAILED for user '{user_id_to_validate}' requested by car '{sender_id}'. Keys do not match.")
+                        # Don't log the keys themselves unless debugging heavily
+                        response.update({"type": "VALIDATE_APP_PUBKEY_NAK", "payload": {"user_id": user_id_to_validate, "status": "INVALID", "reason": "App public key mismatch"}})
+
         # --- Access Validation (Called by Car Server) ---
         elif msg_type == "VALIDATE_ACCESS_ATTEMPT":
              # TODO (AUTH): Verify that this request genuinely came from the car identified by 'sender_id'.

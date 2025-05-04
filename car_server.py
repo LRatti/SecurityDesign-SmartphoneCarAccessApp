@@ -5,6 +5,11 @@ import logging
 import ssl # <-- Import ssl
 from utils import config, network_utils
 import os
+# --- Need cryptography for parsing cert and serializing key ---
+from cryptography import x509
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.backends import default_backend
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - CarServer [{car_id}] - %(threadName)s - %(levelname)s - %(message)s')
 
 class CarServer:
@@ -195,10 +200,90 @@ class CarServer:
 
         return access_granted
 
+    # --- Helper Method: Validate App Public Key with Backend ---
+    def _validate_app_pubkey_with_server(self, app_public_key_pem: str, user_id: str) -> bool:
+        """Contacts the backend server securely (TLS) to validate the app's public key PEM for the given user."""
+        if not app_public_key_pem or not user_id:
+            self._log(logging.ERROR, "App public key PEM or User ID missing for validation call.")
+            return False
+
+        self._log(logging.INFO, f"Validating app public key for user '{user_id}' with backend.")
+        validation_message = {
+            "type": "VALIDATE_APP_PUBKEY", # New message type
+            "sender_id": self.car_id,
+            "payload": {
+                "user_id_to_validate": user_id,
+                "app_public_key_pem": app_public_key_pem
+            }
+        }
+
+        backend_tls_sock = None
+        try:
+            backend_tls_sock = self._connect_to_backend() # Connect securely
+            if not backend_tls_sock:
+                self._log(logging.ERROR,"Failed to connect to backend for app pubkey validation.")
+                return False
+
+            if network_utils.send_message(backend_tls_sock, validation_message):
+                backend_tls_sock.settimeout(5.0)
+                response = network_utils.receive_message(backend_tls_sock)
+                if response and response.get("type") == "VALIDATE_APP_PUBKEY_ACK" and response.get("payload", {}).get("status") == "VALID":
+                    self._log(logging.INFO, f"Backend validation SUCCESS for app public key (User: {user_id}).")
+                    return True
+                else:
+                    reason = response.get("payload", {}).get("reason", "Unknown") if response else "No response"
+                    self._log(logging.WARNING, f"Backend validation FAILED for app public key (User: {user_id}): {reason}")
+                    return False
+            else:
+                self._log(logging.ERROR,"Failed to send app pubkey validation request to backend.")
+                return False
+        # ... (keep exception handling: timeout, ssl error, generic error) ...
+        # --- Catch SSL errors during communication ---
+        except socket.timeout:
+            self._log(logging.ERROR, f"Connection to backend server timed out.")
+        except ssl.SSLError as e:
+             self._log(logging.ERROR, f"SSL error during validation communication with backend: {e}")
+        except Exception as e:
+             self._log(logging.ERROR, f"Error during validation communication with backend: {e}")
+        finally:
+             if backend_tls_sock:
+                 self._log(logging.DEBUG,"Closing backend connection after app pubkey validation.")
+                 try: backend_tls_sock.shutdown(socket.SHUT_RDWR)
+                 except OSError: pass
+                 backend_tls_sock.close()
+
 
     def handle_client(self, ssl_client_socket: ssl.SSLSocket, address): # <-- Takes SSLSocket now
         threading.current_thread().name = f"App-{address[0]}:{address[1]}"
         self._log(logging.INFO, f"TLS connection established with {address}")
+
+        app_public_key_pem = None # Store PEM string now
+
+        try:
+            # Get app certificate in DER format
+            app_cert_der = ssl_client_socket.getpeercert(binary_form=True)
+            if not app_cert_der:
+                 raise ValueError("Could not get peer certificate (app) in binary form.")
+
+            # Parse DER cert, extract public key, serialize to PEM
+            app_cert = x509.load_der_x509_certificate(app_cert_der, default_backend())
+            public_key = app_cert.public_key()
+            app_public_key_pem = public_key.public_bytes(
+                 encoding=serialization.Encoding.PEM,
+                 format=serialization.PublicFormat.SubjectPublicKeyInfo
+            ).decode('utf-8') # Decode to string
+
+            self._log(logging.INFO, f"App public key PEM extracted:\n{app_public_key_pem[:80]}...")
+        except (ValueError, TypeError, ssl.SSLError) as e: # Catch parsing/serialization errors
+             self._log(logging.ERROR, f"Failed to get or process app certificate/key from {address}: {e}. Closing connection.")
+             try: ssl_client_socket.close()
+             except Exception: pass
+             return # Abort handling
+        except Exception as e: # Catch other unexpected errors
+            self._log(logging.ERROR, f"Unexpected error getting app pubkey from {address}: {e}. Closing connection.")
+            try: ssl_client_socket.close()
+            except Exception: pass
+            return # Abort handling
 
         # --- Log Client Cert Info (Optional Debugging) ---
         try:
@@ -222,8 +307,9 @@ class CarServer:
                 if message is None:
                     break
 
-                response = self.process_message(message) # Process logic remains the same
-
+                # --- Pass message AND public key PEM to process_message ---
+                response = self.process_message(message, app_public_key_pem, ssl_client_socket)
+                
                 if response:
                     # Send response over the SSL socket
                     if not network_utils.send_message(ssl_client_socket, response):
@@ -243,10 +329,10 @@ class CarServer:
                 pass # Ignore if already closed
             ssl_client_socket.close()
 
-    def process_message(self, message: dict) -> dict | None:
+    def process_message(self, message: dict, app_public_key_pem: str, ssl_sock: ssl.SSLSocket) -> dict | None:        
         msg_type = message.get('type')
         # This is the user interacting with the car via the app
-        requesting_user_id = message.get('sender_id')
+        requesting_user_id = message.get('sender_id')        
         payload = message.get('payload', {}) # Use if needed
         # TODO (AUTH): Extract signature/auth_data from payload.
         #   auth_data = payload.get('auth_data') # Could be signature or signed nonce
@@ -257,6 +343,17 @@ class CarServer:
 
         self._log(logging.INFO, f"Processing message type '{msg_type}' from user '{requesting_user_id}'")
 
+        # ---=== Step 1: Validate App Public Key against User ID ===---
+        if not self._validate_app_pubkey_with_server(app_public_key_pem, requesting_user_id): # Call new validator
+             # Validation failed! Logged in helper function.
+             self._log(logging.WARNING, f"Authentication failed for user '{requesting_user_id}' due to app public key mismatch.")
+             nak_type = "ERROR"
+             if msg_type.endswith("_REQUEST"): nak_type = msg_type.replace("_REQUEST", "_NAK")
+             return {"type": nak_type, "sender_id": self.car_id, "payload": {"error": "Authentication failed"}}
+        # ---=== Validation Successful ===---
+
+
+        # --- Step 2: Proceed with message processing (permission checks, etc.) ---
         response = {"sender_id": self.car_id}
 
         # --- Helper for App Signature Verification ---

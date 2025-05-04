@@ -7,6 +7,11 @@ import time
 import json # For pretty printing responses
 import os
 from utils import config, network_utils
+# --- Cryptography for parsing cert and serializing key ---
+from cryptography import x509
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.backends import default_backend
+# -------------------------------------------------------------
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - AppClient - %(levelname)s - %(message)s')
 
@@ -370,24 +375,45 @@ class AppClient:
     def register_with_server(self):
         """Registers the user's public key with the backend server."""
         logging.info("Attempting to register with the backend server...")
+        
+        app_public_key_pem = None # Initialize to None
+
+        # --- Load app cert, extract public key, serialize to PEM ---
+        try:
+            with open(config.APP_CERT_FILE, 'rb') as f: # Read bytes
+                app_cert_pem_bytes = f.read()
+            app_cert = x509.load_pem_x509_certificate(app_cert_pem_bytes, default_backend())
+            public_key = app_cert.public_key()
+            app_public_key_pem = public_key.public_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo
+            ).decode('utf-8') # Decode bytes to string for JSON
+            logging.debug("Extracted and serialized app public key PEM for registration.")
+        except FileNotFoundError:
+            logging.error(f"Cannot register user: App certificate file '{config.APP_CERT_FILE}' not found.")
+            return False
+        except (IOError, ValueError, TypeError) as e: # Catch parsing/serialization errors
+            logging.error(f"Cannot register user: Error processing app certificate/key: {e}")
+            return False
+        
         message = {
             "type": "REGISTER",
             "sender_id": self.user_id,
             "payload": {
-                "public_key": self.public_key # Use the actual public key here
-                # TODO (AUTH): Add signature if the server requires signed registration requests.
-
+                "app_public_key_pem": app_public_key_pem # <-- Send the public key PEM
             }
         }
+
         # NOTE (AUTH): No signature added here in current placeholder structure,
         #   assuming server trusts initial registration or uses an out-of-band verification.
 
-        response = self._send_and_receive(self.server_addr, message) # No target_car_id
+        response = self._send_and_receive(self.server_addr, message) # Uses TLS backend connection
         if response and response.get("type") == "REGISTER_ACK":
             logging.info("Registration successful!")
             return True
         else:
-            logging.error(f"Registration failed.")
+            error = response.get("payload", {}).get("error", "Unknown error") if response else "No response/comm error"
+            logging.error(f"Registration failed: {error}")
             return False
 
     def check_license_status(self):
