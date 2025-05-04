@@ -420,67 +420,89 @@ class BackendServer:
         # --- Delegation Management ---
         elif msg_type == "DELEGATE_ACCESS":
             # TODO (AUTH): Verify signature from 'sender_id' (owner) on the payload. Crucial.
-            # signature = message.get('signature')
-            # data_signed = json.dumps(payload)
-            # if not verify_user_signature(sender_id, data_signed, signature):
-            #     return {"type": "DELEGATE_NAK", "payload": {"error": "Invalid signature for delegation"}}
             sender_id = message.get('sender_id') # Owner performing delegation
-            # sender_id here MUST be the owner initiating the delegation
             if not sender_id: return {"type": "ERROR", "payload": {"error": "Missing sender_id (owner) for DELEGATE_ACCESS"}}
+
+            payload = message.get('payload', {}) # Define payload here
             car_id = payload.get('car_id')
             recipient_user_id = payload.get('recipient_user_id')
             permissions = payload.get('permissions', [])
             duration_seconds = payload.get('duration_seconds', 3600) # Default 1 hour
 
+            response = {"sender_id": "server"} # Initialize response here
+
             if not car_id or not recipient_user_id or not permissions:
                 response.update({"type": "DELEGATE_NAK", "payload": {"error": "Missing car_id, recipient_user_id, or permissions"}})
+            # --- Start: Added Validation Block ---
+            elif not all(p in config.VALID_PERMISSIONS for p in permissions):
+                response.update({"type": "DELEGATE_NAK", "payload": {"error": f"Invalid permissions specified. Valid: {config.VALID_PERMISSIONS}"}})
             else:
-                 # Validate permissions
-                 if not all(p in config.VALID_PERMISSIONS for p in permissions):
-                     response.update({"type": "DELEGATE_NAK", "payload": {"error": f"Invalid permissions specified. Valid: {config.VALID_PERMISSIONS}"}})
-                 else:
-                     # Check ownership
-                     with self.car_lock:
-                         car_info = self.cars.get(car_id)
-                     if not car_info:
-                         response.update({"type": "DELEGATE_NAK", "payload": {"error": f"Car '{car_id}' not registered"}})
-                     elif car_info.get('owner_user_id') != sender_id:
-                         response.update({"type": "DELEGATE_NAK", "payload": {"error": f"User '{sender_id}' does not own car '{car_id}'"}})
-                     else:
-                         # Check if recipient exists
-                         with self.user_lock:
-                            if recipient_user_id not in self.users:
-                                 response.update({"type": "DELEGATE_NAK", "payload": {"error": f"Recipient user '{recipient_user_id}' not registered"}})
-                            else:
-                                 # Create delegation
-                                 delegation_id = str(uuid.uuid4())
-                                 expiry_timestamp = time.time() + duration_seconds
-                                 delegation_record = {
-                                     'delegation_id': delegation_id, # Add for easier lookup if needed
-                                     'car_id': car_id,
-                                     'owner_user_id': sender_id,
-                                     'recipient_user_id': recipient_user_id,
-                                     'permissions': permissions,
-                                     'expiry_timestamp': expiry_timestamp,
-                                     'status': 'active'
-                                 }
-                                 with self.delegation_lock:
-                                     self.delegations[delegation_id] = delegation_record
-                                     self._save_json(config.DELEGATIONS_FILE, self.delegations, "delegations")
+                # Check ownership first (outside delegation lock)
+                with self.car_lock:
+                    car_info = self.cars.get(car_id)
+                if not car_info:
+                    response.update({"type": "DELEGATE_NAK", "payload": {"error": f"Car '{car_id}' not registered"}})
+                elif car_info.get('owner_user_id') != sender_id:
+                    response.update({"type": "DELEGATE_NAK", "payload": {"error": f"User '{sender_id}' does not own car '{car_id}'"}})
+                else:
+                    # Check if recipient exists (outside delegation lock)
+                    with self.user_lock:
+                       if recipient_user_id not in self.users:
+                            response.update({"type": "DELEGATE_NAK", "payload": {"error": f"Recipient user '{recipient_user_id}' not registered"}})
+                       else:
+                           # --- Now check for existing delegations FOR THIS CAR (inside delegation lock) ---
+                           with self.delegation_lock:
+                                car_already_delegated = False
+                                active_delegation_recipient = None
+                                for existing_delegation in self.delegations.values():
+                                    # Check if there's an *active* and *unexpired* delegation for the *same car*
+                                    if (existing_delegation['car_id'] == car_id and
+                                        existing_delegation['status'] == 'active' and
+                                        time.time() < existing_delegation['expiry_timestamp']):
+                                         car_already_delegated = True
+                                         active_delegation_recipient = existing_delegation['recipient_user_id']
+                                         break # Found one, no need to check further
 
-                                 response.update({
-                                     "type": "DELEGATE_ACK",
-                                     "payload": {
-                                         "status": "OK",
-                                         "delegation_id": delegation_id,
-                                         "car_id": car_id,
-                                         "recipient": recipient_user_id,
-                                         "permissions": permissions,
-                                         "expires_at": expiry_timestamp
-                                     }
-                                 })
-                                 logging.info(f"Delegation '{delegation_id}' created for car '{car_id}' to user '{recipient_user_id}' by owner '{sender_id}'.")
+                                if car_already_delegated:
+                                     # Car already has an active delegation, reject this new one
+                                     logging.warning(f"Delegation failed: Car '{car_id}' already has an active delegation to user '{active_delegation_recipient}'.")
+                                     response.update({"type": "DELEGATE_NAK", "payload": {"error": f"Car '{car_id}' already has an active delegation to another user ({active_delegation_recipient}). Revoke existing delegation first."}})
+                                     # --- Important: Return here ---
+                                     return response # Exit processing for DELEGATE_ACCESS
 
+                                # --- If we reach here, the car is not currently delegated actively ---
+                                # Create the new delegation
+                                delegation_id = str(uuid.uuid4())
+                                expiry_timestamp = time.time() + duration_seconds
+                                delegation_record = {
+                                    'delegation_id': delegation_id,
+                                    'car_id': car_id,
+                                    'owner_user_id': sender_id,
+                                    'recipient_user_id': recipient_user_id,
+                                    'permissions': permissions,
+                                    'expiry_timestamp': expiry_timestamp,
+                                    'status': 'active'
+                                }
+                                self.delegations[delegation_id] = delegation_record
+                                delegations_copy = self.delegations.copy() # Create copy inside lock
+
+                           # --- Save outside the lock ---
+                           self._save_json(config.DELEGATIONS_FILE, delegations_copy, "delegations")
+
+                           # --- Update response for SUCCESS ---
+                           response.update({
+                               "type": "DELEGATE_ACK",
+                               "payload": {
+                                   "status": "OK",
+                                   "delegation_id": delegation_id,
+                                   "car_id": car_id,
+                                   "recipient": recipient_user_id,
+                                   "permissions": permissions,
+                                   "expires_at": expiry_timestamp
+                               }
+                           })
+                           logging.info(f"Delegation '{delegation_id}' created for car '{car_id}' to user '{recipient_user_id}' by owner '{sender_id}'.")
+                           
         elif msg_type == "REVOKE_DELEGATION":
              # TODO (AUTH): Verify signature from 'sender_id' (owner) on the payload. Crucial.
              # signature = message.get('signature')

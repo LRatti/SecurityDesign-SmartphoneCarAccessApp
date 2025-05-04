@@ -21,6 +21,7 @@ class CarServer:
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.is_unlocked = False
         self.is_started = False
+        self.started_by_user_id = None  # Track who started the car
         self.backend_server_addr = (config.SERVER_IP, config.SERVER_PORT)
         # Inject car_id into logger extra context for formatting
         self.logger = logging.getLogger(__name__)
@@ -370,7 +371,7 @@ class CarServer:
             return True # Placeholder
 
         # --- Car Actions (require validation AND direct app auth) ---
-        action_requires_direct_auth = msg_type in ["UNLOCK_REQUEST", "START_REQUEST", "LOCK_REQUEST"]
+        action_requires_direct_auth = msg_type in ["UNLOCK_REQUEST", "START_REQUEST", "LOCK_REQUEST", "STOP_CAR_REQUEST"]
 
         # TODO (AUTH): Add Challenge-Response Handling Here if applicable
         #   - If msg_type is INITIATE_UNLOCK/START: generate nonce, store it mapped to user/session, send back nonce.
@@ -391,6 +392,7 @@ class CarServer:
             if self._validate_action_with_server(requesting_user_id, action_to_validate):
                 self.is_unlocked = True
                 self.is_started = False # Ensure started state is reset
+                self.started_by_user_id = None # Reset starter on unlock
                 response.update({"type": "UNLOCK_ACK", "payload": {"status": "Unlocked"}})
                 self._log(logging.INFO, f"Car unlocked by {requesting_user_id} (Validation OK)")
             else:
@@ -404,25 +406,48 @@ class CarServer:
                  self._log(logging.WARNING, f"Start failed for {requesting_user_id} (Car locked)")
             elif self._validate_action_with_server(requesting_user_id, action_to_validate):
                  self.is_started = True
+                 # --- Store the user who started the car ---
+                 self.started_by_user_id = requesting_user_id
+                 # ------------------------------------------
+                 
                  response.update({"type": "START_ACK", "payload": {"status": "Started"}})
-                 self._log(logging.INFO, f"Car started by {requesting_user_id} (Validation OK)")
-            else: # Validation failed
+                 self._log(logging.INFO, f"Car started by {self.started_by_user_id} (Validation OK)")
+            else:
                  response.update({"type": "START_NAK", "payload": {"error": "Access denied by server or validation failed"}})
                  self._log(logging.WARNING, f"Start failed for {requesting_user_id} (Validation Failed)")
 
         elif msg_type == "LOCK_REQUEST":
-            # Optional: Should locking require validation? Maybe only if unlocked by someone else?
-            # For simplicity, let's allow anyone connected to lock (could be debated).
-            # Or, maybe validate with UNLOCK permission? Let's validate.
-             action_to_validate = config.PERMISSION_UNLOCK # Require unlock permission to lock again
+             action_to_validate = config.PERMISSION_UNLOCK # Require unlock permission to lock
              if self._validate_action_with_server(requesting_user_id, action_to_validate):
+                 original_starter = self.started_by_user_id # Log who started it, if anyone
                  self.is_unlocked = False
                  self.is_started = False
+                 self.started_by_user_id = None # Reset starter on lock
                  response.update({"type": "LOCK_ACK", "payload": {"status": "Locked"}})
-                 self._log(logging.INFO, f"Car locked by {requesting_user_id} (Validation OK)")
+                 log_msg = f"Car locked by {requesting_user_id} (Validation OK)."
+                 if original_starter:
+                     log_msg += f" Car was previously started by {original_starter}."
+                 self._log(logging.INFO, log_msg)
              else:
                   response.update({"type": "LOCK_NAK", "payload": {"error": "Access denied for locking (validation failed)"}})
                   self._log(logging.WARNING, f"Lock failed for {requesting_user_id} (Validation Failed)")
+
+        elif msg_type == "STOP_CAR_REQUEST":
+            if not self.is_started:
+                # Condition 1: Car must be started
+                response.update({"type": "STOP_CAR_NAK", "payload": {"error": "Car is not started"}})
+                self._log(logging.WARNING, f"Stop car request failed for {requesting_user_id}: Car not started.")
+            elif self.started_by_user_id != requesting_user_id:
+                # Condition 2: Requester must be the one who started it
+                response.update({"type": "STOP_CAR_NAK", "payload": {"error": f"Action denied. Car was started by '{self.started_by_user_id}'."}})
+                self._log(logging.WARNING, f"Stop car request denied for {requesting_user_id}. Car started by {self.started_by_user_id}.")
+            else:
+                # Conditions met: Stop the car
+                self.is_started = False
+                stopped_by = self.started_by_user_id # Store temporarily for logging
+                self.started_by_user_id = None # Reset the starter ID
+                response.update({"type": "STOP_CAR_ACK", "payload": {"status": "Stopped"}})
+                self._log(logging.INFO, f"Car stopped by {stopped_by}.")
 
 
         # --- Simple Hello/Ping (doesn't need validation) ---
