@@ -28,7 +28,7 @@ VALID_PERMISSIONS = {PERMISSION_UNLOCK, PERMISSION_START}
 CERT_DIR = os.path.join(os.path.dirname(__file__), '..', 'certs')
 
 # Ensure certs directory exists (optional, good for setup)
-# os.makedirs(CERT_DIR, exist_ok=True)
+os.makedirs(CERT_DIR, exist_ok=True)
 
 # Certificate Authority
 CA_CERT_FILE = os.path.join(CERT_DIR, 'ca-cert.pem')
@@ -37,9 +37,25 @@ CA_CERT_FILE = os.path.join(CERT_DIR, 'ca-cert.pem')
 CAR_CERT_FILE = os.path.join(CERT_DIR, 'car-cert.pem')
 CAR_KEY_FILE = os.path.join(CERT_DIR, 'car-key.pem')
 
+# Directory for user-specific certs (can be the same as CERT_DIR)
+# USER_CERT_DIR = CERT_DIR # Or a subdirectory if preferred
+USER_CERT_DIR = os.path.join(CERT_DIR, 'users')
+os.makedirs(USER_CERT_DIR, exist_ok=True) # Ensure it exists if using subdirectory
+
+def get_user_cert_path(user_id):
+    """Gets the path for a user's certificate."""
+    return os.path.join(USER_CERT_DIR, f"user_{user_id}_cert.pem")
+
+def get_user_key_path(user_id):
+    """Gets the path for a user's private key."""
+    return os.path.join(USER_CERT_DIR, f"user_{user_id}_key.pem")
+
+# Certificate Authority Key (Needed by backend for signing)
+CA_KEY_FILE = os.path.join(CERT_DIR, 'ca-key.pem')
+
 # App Client Certificates (Example - could be user-specific in a real app)
-APP_CERT_FILE = os.path.join(CERT_DIR, 'app-cert.pem')
-APP_KEY_FILE = os.path.join(CERT_DIR, 'app-key.pem')
+PROVISIONING_APP_CERT_FILE = os.path.join(CERT_DIR, 'app-cert.pem')
+PROVISIONING_APP_KEY_FILE = os.path.join(CERT_DIR, 'app-key.pem')
 
 # Backend Server Certificates (NEW)
 SERVER_CERT_FILE = os.path.join(CERT_DIR, 'server-cert.pem')

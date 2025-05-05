@@ -8,37 +8,84 @@ import json # For pretty printing responses
 import os
 import getpass # <-- Add getpass for hidden PIN input
 from utils import config, network_utils
+from datetime import datetime, timedelta # For cert validity
 # --- Cryptography for parsing cert and serializing key ---
 from cryptography import x509
-from cryptography.hazmat.primitives import serialization
+from cryptography.x509.oid import NameOID
+from cryptography.hazmat.primitives import serialization, hashes as crypto_hashes # Rename alias
 from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives.asymmetric import ec
+
 # -------------------------------------------------------------
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - AppClient - %(levelname)s - %(message)s')
 
-# --- Centralized place to create backend SSL context ---
-# (Can be used by AppClient instance and also standalone login/signup)
-def create_backend_ssl_context():
+# --- SSL Context Creation ---
+
+def create_provisioning_ssl_context():
+    """Creates SSL context using the generic provisioning cert/key."""
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     try:
-        # Uses APP cert/key to authenticate itself to BACKEND
-        context.load_cert_chain(certfile=config.APP_CERT_FILE, keyfile=config.APP_KEY_FILE)
+        # Uses GENERIC APP cert/key for initial connection
+        context.load_cert_chain(certfile=config.PROVISIONING_APP_CERT_FILE,
+                                keyfile=config.PROVISIONING_APP_KEY_FILE)
         # Uses CA cert to verify BACKEND SERVER's cert
         context.load_verify_locations(cafile=config.CA_CERT_FILE)
         context.verify_mode = ssl.CERT_REQUIRED
-        context.check_hostname = False # Set True if backend cert CN=localhost (for this setup)
+        context.check_hostname = False # As before
         if not context.check_hostname:
-                logging.warning("SSL Hostname Check is DISABLED for Backend connection. Enable in production.")
-        logging.debug("BACKEND SSL context created successfully for mTLS.")
+            logging.warning("SSL Hostname Check is DISABLED for Backend connection.")
+        logging.debug("PROVISIONING SSL context created successfully for mTLS.")
         return context
+    except FileNotFoundError as e:
+        logging.critical(f"Provisioning certificate/key file not found: {e}")
+        raise SystemExit("Cannot proceed without provisioning SSL context.")
     except Exception as e:
-        logging.critical(f"Failed to create backend SSL context: {e}")
-        raise SystemExit("Cannot proceed without backend SSL context.")
+        logging.critical(f"Failed to create provisioning SSL context: {e}")
+        raise SystemExit("Cannot proceed without provisioning SSL context.")
 
-# --- Login/Signup Functions (outside AppClient class) ---
-def _send_receive_auth(message: dict):
-    """Sends an auth message (login/signup) to backend and gets response."""
-    context = create_backend_ssl_context()
+def create_user_ssl_context(user_id: str):
+    """Creates SSL context using user-specific cert/key."""
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    user_cert_file = config.get_user_cert_path(user_id)
+    user_key_file = config.get_user_key_path(user_id)
+    try:
+        if not os.path.exists(user_cert_file) or not os.path.exists(user_key_file):
+            logging.error(f"User certificate or key not found for user '{user_id}' at expected paths.")
+            logging.error(f"Cert path: {user_cert_file}")
+            logging.error(f"Key path: {user_key_file}")
+            # This context will fail to load, handled below
+            # raise FileNotFoundError("User cert/key missing") # Or handle gracefully later
+
+        # Uses USER-SPECIFIC cert/key
+        context.load_cert_chain(certfile=user_cert_file, keyfile=user_key_file)
+        # Uses CA cert to verify server cert (Backend or Car)
+        context.load_verify_locations(cafile=config.CA_CERT_FILE)
+        context.verify_mode = ssl.CERT_REQUIRED
+        context.check_hostname = False # As before for backend/car
+        if not context.check_hostname:
+            logging.warning("SSL Hostname Check is DISABLED for Backend/Car connection.")
+
+        # Optional: Set specific TLS versions or cipher suites
+        context.minimum_version = ssl.TLSVersion.TLSv1_3
+
+        logging.debug(f"User-specific SSL context created successfully for '{user_id}'.")
+        return context
+    except FileNotFoundError:
+         # Logged above, just raise SystemExit or return None depending on usage
+         logging.critical(f"Failed to create SSL context: User certificate or key for '{user_id}' not found.")
+         raise SystemExit(f"Login requires user certificate/key. Please sign up first or check paths.")
+    except ssl.SSLError as e:
+        logging.critical(f"SSL Error creating user context for '{user_id}': {e}")
+        raise SystemExit("Failed to initialize user SSL context.")
+    except Exception as e:
+        logging.critical(f"Failed to create user SSL context for '{user_id}': {e}")
+        raise SystemExit("Cannot proceed without user SSL context.")
+
+# --- Auth Send/Receive Helper ---
+def _send_receive_auth(message: dict, context: ssl.SSLContext):
+    """Sends an auth message (login/signup) using the provided SSL context."""
+    # Context is now passed in
     raw_sock = None
     ssl_sock = None
     address = (config.SERVER_IP, config.SERVER_PORT)
@@ -51,7 +98,6 @@ def _send_receive_auth(message: dict):
         ssl_sock = context.wrap_socket(raw_sock, server_hostname=server_hostname)
         logging.info(f"TLS connection established successfully to backend server {address} for auth")
 
-        # Send message
         if network_utils.send_message(ssl_sock, message):
             ssl_sock.settimeout(10.0)
             response = network_utils.receive_message(ssl_sock)
@@ -61,51 +107,131 @@ def _send_receive_auth(message: dict):
     except (socket.timeout, socket.error, ssl.SSLError, Exception) as e:
         logging.error(f"Error during backend communication for {message.get('type')}: {e}")
     finally:
+        # ... (cleanup as before) ...
         if ssl_sock:
-            try:
-                ssl_sock.shutdown(socket.SHUT_RDWR)
+            try: ssl_sock.shutdown(socket.SHUT_RDWR)
             except OSError: pass
             ssl_sock.close()
         elif raw_sock:
             raw_sock.close()
     return response
 
+
+# --- Signup Function (Modified) ---
 def signup_with_server(user_id: str, pin: str) -> bool:
-    """Attempts to sign up a new user with the backend."""
+    """Attempts signup: generates keys, creates CSR, sends to backend, saves keys/cert."""
     logging.info(f"Attempting signup for user '{user_id}'...")
-    # Note: Public key is implicitly sent via the client certificate during TLS handshake
-    # The backend's handle_client extracts it.
+
+    # --- Step 1: Generate Key Pair ---
+    try:
+        private_key = ec.generate_private_key(ec.SECP256R1(), default_backend())
+        public_key = private_key.public_key()
+        logging.info(f"Generated new key pair for user '{user_id}'.")
+
+        # Serialize private key to PEM (for saving later)
+        private_key_pem = private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption() # No password on key file for PoC
+        )
+    except Exception as e:
+        logging.error(f"Failed to generate key pair: {e}")
+        return False
+
+    # --- Step 2: Create CSR ---
+    try:
+        csr = x509.CertificateSigningRequestBuilder().subject_name(x509.Name([
+            x509.NameAttribute(NameOID.COUNTRY_NAME, u"BE"), # Example attribute
+            x509.NameAttribute(NameOID.STATE_OR_PROVINCE_NAME, u"East Flanders"), # Example
+            x509.NameAttribute(NameOID.LOCALITY_NAME, u"Ghent"), # Example
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, u"PoC Corp"), # Example
+            x509.NameAttribute(NameOID.COMMON_NAME, user_id), # CRUCIAL: CN = User ID
+        ])).add_extension( # Basic constraints example
+            x509.BasicConstraints(ca=False, path_length=None), critical=True,
+        ).sign(private_key, crypto_hashes.SHA256(), default_backend()) # Sign with the NEW private key
+
+        csr_pem = csr.public_bytes(serialization.Encoding.PEM)
+        logging.info(f"Created CSR for user '{user_id}'.")
+    except Exception as e:
+        logging.error(f"Failed to create CSR: {e}")
+        return False
+
+    # --- Step 3: Send Signup Request with CSR ---
     message = {
         "type": "SIGNUP",
         "payload": {
             "user_id": user_id,
-            "pin": pin
-            # No need to send app_public_key_pem here, backend gets from cert
+            "pin": pin,
+            "csr_pem": csr_pem.decode('utf-8') # Send CSR PEM as string
         }
     }
-    response = _send_receive_auth(message)
+
+    # Use the PROVISIONING context for the signup request itself
+    provisioning_context = create_provisioning_ssl_context()
+    response = _send_receive_auth(message, provisioning_context)
+
+    # --- Step 4: Process Response & Save Files ---
     if response and response.get("type") == "SIGNUP_ACK":
-        logging.info("Signup successful!")
+        received_cert_pem_str = response.get("payload", {}).get("certificate_pem")
+        if not received_cert_pem_str:
+            logging.error("Signup ACK received, but missing certificate PEM from server.")
+            return False
+
+        # Save Private Key
+        user_key_path = config.get_user_key_path(user_id)
+        try:
+            with open(user_key_path, "wb") as f: # Write bytes
+                f.write(private_key_pem)
+            os.chmod(user_key_path, 0o600) # Restrict permissions (best effort)
+            logging.info(f"Saved private key for '{user_id}' to {user_key_path}")
+        except IOError as e:
+            logging.error(f"Failed to save private key for '{user_id}': {e}")
+            # Consider cleanup? Maybe delete user on server? For PoC, just fail.
+            return False
+
+        # Save Received Certificate
+        user_cert_path = config.get_user_cert_path(user_id)
+        try:
+            with open(user_cert_path, "w") as f:
+                f.write(received_cert_pem_str)
+            logging.info(f"Saved certificate for '{user_id}' to {user_cert_path}")
+        except IOError as e:
+            logging.error(f"Failed to save certificate for '{user_id}': {e}")
+            # Consider cleanup? Delete key file? Delete user on server? For PoC, just fail.
+            return False
+
+        logging.info(f"Signup successful for '{user_id}'! Certificate and key saved.")
         return True
     else:
         error = response.get("payload", {}).get("error", "Unknown error") if response else "Communication error"
         logging.error(f"Signup failed: {error}")
         return False
 
+# --- Login Function (Modified) ---
 def login_with_server(user_id: str, pin: str) -> bool:
-    """Attempts to log in a user with the backend."""
+    """Attempts login using user-specific cert/key."""
     logging.info(f"Attempting login for user '{user_id}'...")
+
+    # --- Step 1: Create SSL Context with User's Cert/Key ---
+    try:
+        user_context = create_user_ssl_context(user_id) # Will raise SystemExit if files missing
+    except SystemExit:
+        # Error already logged in create_user_ssl_context
+        return False # Cannot login without cert/key
+
+    # --- Step 2: Send Login Request ---
     message = {
         "type": "LOGIN",
         "payload": {
-            "user_id": user_id,
+            "user_id": user_id, # Send user_id in payload too for server-side verification
             "pin": pin
         }
     }
-    response = _send_receive_auth(message)
+    response = _send_receive_auth(message, user_context) # Use USER context
+
+    # --- Step 3: Process Response ---
     if response and response.get("type") == "LOGIN_ACK":
-        logging.info("Login successful!")
-        # You could potentially store session info/token here if needed later
+        logging.info(f"Login successful for user '{user_id}'!")
         return True
     else:
         error = response.get("payload", {}).get("error", "Invalid user ID or PIN") if response else "Communication error"
@@ -124,84 +250,56 @@ class AppClient:
         # self.public_key = f"pubkey_for_{self.user_id}" # Placeholder! Replace
 
         self.last_delegation_id = None # Store last created delegation ID for easy revocation
+        
         # --- TLS Setup ---
-        self.car_ssl_context = self._create_car_ssl_context() # Renamed for clarity
-        # We use the shared function for backend context creation if needed within the class
-        self.backend_ssl_context = create_backend_ssl_context()
-
-    def _create_car_ssl_context(self):
-        # Use PROTOCOL_TLS_CLIENT for client-side context
-        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        # --- Load User-Specific SSL Contexts ---
+        # This assumes __init__ is called *after* successful login
         try:
-            logging.info(f"Loading APP cert chain: {config.APP_CERT_FILE}, {config.APP_KEY_FILE}")
-            # Uses APP cert/key to authenticate itself to CAR
-            context.load_cert_chain(certfile=config.APP_CERT_FILE, keyfile=config.APP_KEY_FILE)
-            logging.info(f"Loading CA cert for server verification: {config.CA_CERT_FILE}")
-            # Load CA cert to verify the server's certificate
-            # Uses CA cert to verify CAR's cert
+            # Context for connecting to the BACKEND (using user cert)
+            self.backend_ssl_context = create_user_ssl_context(self.user_id)
+            # Context for connecting to the CAR (using user cert)
+            self.car_ssl_context = self._create_car_ssl_context_for_user() # Use a separate method for clarity
+
+        except SystemExit as e:
+             # If context creation fails here (e.g., files deleted after login?), re-raise
+             logging.critical(f"Failed to initialize AppClient for {user_id}: {e}")
+             raise # Propagate the SystemExit
+
+    def _create_car_ssl_context_for_user(self):
+        """Creates the SSL context for connecting to the CAR using user's cert."""
+        # This is very similar to create_user_ssl_context, but targets the car verification
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        user_cert_file = config.get_user_cert_path(self.user_id)
+        user_key_file = config.get_user_key_path(self.user_id)
+        try:
+            logging.info(f"Loading USER cert chain for CAR connection: {user_cert_file}, {user_key_file}")
+            context.load_cert_chain(certfile=user_cert_file, keyfile=user_key_file)
+
+            logging.info(f"Loading CA cert for CAR server verification: {config.CA_CERT_FILE}")
             context.load_verify_locations(cafile=config.CA_CERT_FILE)
             context.verify_mode = ssl.CERT_REQUIRED
-            # Hostname checking - IMPORTANT for production
-            # If server cert CN is 'localhost' or IP, set check_hostname=True
-            # If using a self-signed cert without matching CN, set to False for testing ONLY
-            context.check_hostname = False # Set to True if car cert CN matches config.CAR_IP/hostname
-            if (not context.check_hostname):
-                logging.warning("SSL Hostname Check is DISABLED. Enable in production.")
+            context.check_hostname = False # As before for car
+            if not context.check_hostname:
+                logging.warning("SSL Hostname Check is DISABLED for Car connection.")
 
-            # Optional: Set specific TLS versions or cipher suites
             context.minimum_version = ssl.TLSVersion.TLSv1_3
-
-            logging.info("SSL context created successfully for mTLS.")
+            logging.info(f"CAR SSL context created successfully for user '{self.user_id}'.")
             return context
+        except FileNotFoundError:
+             logging.critical(f"User certificate/key not found for CAR context (User: {self.user_id}).")
+             raise SystemExit("User cert/key missing for car connection.")
         except ssl.SSLError as e:
-            logging.critical(f"SSL Error creating client context: {e}")
-            raise SystemExit("Failed to initialize SSL context - check certificate paths and permissions.")
-        except FileNotFoundError as e:
-             logging.critical(f"Certificate file not found: {e}")
-             raise SystemExit("Failed to initialize SSL context - certificate file missing.")
+            logging.critical(f"SSL Error creating user-specific CAR context: {e}")
+            raise SystemExit("Failed to initialize CAR SSL context.")
         except Exception as e:
-             logging.critical(f"Unexpected error creating CAR SSL context: {e}")
-             # Exit or proper handling if context fails
+             logging.critical(f"Unexpected error creating user-specific CAR SSL context: {e}")
              raise SystemExit("Failed to initialize CAR SSL context.")
-        
-     # --- REMOVED: _create_backend_ssl_context (using shared function now) ---
-   
-     # --- Create SSL Context for BACKEND connection ---
-    # def _create_backend_ssl_context(self):
-    #     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    #     try:
-    #         logging.info(f"Loading APP cert chain for backend: {config.APP_CERT_FILE}, {config.APP_KEY_FILE}")
-    #         # Uses APP cert/key to authenticate itself to BACKEND
-    #         context.load_cert_chain(certfile=config.APP_CERT_FILE, keyfile=config.APP_KEY_FILE)
-
-    #         logging.info(f"Loading CA cert for backend server verification: {config.CA_CERT_FILE}")
-    #         # Uses CA cert to verify BACKEND SERVER's cert
-    #         context.load_verify_locations(cafile=config.CA_CERT_FILE)
-    #         context.verify_mode = ssl.CERT_REQUIRED
-
-    #         # Hostname checking for the backend server - IMPORTANT
-    #         # Set to True if backend server cert CN matches config.SERVER_IP/hostname
-    #         context.check_hostname = False # Set True if backend cert CN=localhost (for this setup)
-    #         if not context.check_hostname:
-    #              logging.warning("SSL Hostname Check is DISABLED for Backend connection. Enable in production.")
-
-    #         logging.info("BACKEND SSL context created successfully for mTLS.")
-    #         return context
-    #     except ssl.SSLError as e:
-    #         logging.critical(f"SSL Error creating backend client context: {e}")
-    #         raise SystemExit("Failed to initialize backend SSL context.")
-    #     except FileNotFoundError as e:
-    #          logging.critical(f"Certificate file not found for backend context: {e}")
-    #          raise SystemExit("Failed to initialize backend SSL context.")
-    #     except Exception as e:
-    #          logging.critical(f"Unexpected error creating backend SSL context: {e}")
-    #          raise SystemExit("Failed to initialize backend SSL context.")
-
 
     def _connect(self, address, target_car_id: str): # <-- Add target_car_id
         """Establishes a TLS connection to the given address."""
-        if not self.car_ssl_context: # Use the CAR context
-             logging.error("Cannot connect to car: SSL context not initialized.")
+        # Uses self.car_ssl_context (which is user-specific)
+        if not self.car_ssl_context:
+             logging.error("Cannot connect to car: User-specific SSL context not initialized.")
              return None
 
         raw_sock = None
@@ -224,6 +322,7 @@ class AppClient:
             logging.info("Retrieving car's certificate for validation...")
             try:
                 # Get certificate in DER format for consistent hashing
+                # ... (fingerprint calculation) ...
                 car_cert_der = ssl_sock.getpeercert(binary_form=True)
                 if not car_cert_der:
                     raise ValueError("Could not retrieve peer certificate in binary form.")
@@ -298,17 +397,14 @@ class AppClient:
         raw_sock = None
         ssl_sock = None
         try:
-            logging.debug(f"Attempting raw socket connection to backend {address}")
+            logging.debug(f"Attempting raw socket connection to backend {address} (User: {self.user_id})")
             raw_sock = socket.create_connection(address, timeout=5.0)
             logging.debug(f"Raw socket connected to backend {address}")
 
-            logging.debug(f"Wrapping socket for backend TLS handshake")
-            # Determine server_hostname for backend connection if needed
+            logging.debug(f"Wrapping socket for backend TLS handshake (User: {self.user_id})")
             server_hostname = address[0] if self.backend_ssl_context.check_hostname else None
-            # --- Use self.backend_ssl_context ---
             ssl_sock = self.backend_ssl_context.wrap_socket(raw_sock, server_hostname=server_hostname)
-
-            logging.info(f"TLS connection established successfully to backend server {address}")
+            logging.info(f"TLS connection established successfully to backend server {address} (User: {self.user_id})")
             # Optional: Log backend server cert details
             try:
                 server_cert = ssl_sock.getpeercert()
@@ -474,52 +570,6 @@ class AppClient:
 
         return response
 
-    # --- REMOVED: register_with_server (handled by standalone signup_with_server) ---
-
-    # def register_with_server(self):
-    #     """Registers the user's public key with the backend server."""
-    #     logging.info("Attempting to register with the backend server...")
-        
-    #     app_public_key_pem = None # Initialize to None
-
-    #     # --- Load app cert, extract public key, serialize to PEM ---
-    #     try:
-    #         with open(config.APP_CERT_FILE, 'rb') as f: # Read bytes
-    #             app_cert_pem_bytes = f.read()
-    #         app_cert = x509.load_pem_x509_certificate(app_cert_pem_bytes, default_backend())
-    #         public_key = app_cert.public_key()
-    #         app_public_key_pem = public_key.public_bytes(
-    #             encoding=serialization.Encoding.PEM,
-    #             format=serialization.PublicFormat.SubjectPublicKeyInfo
-    #         ).decode('utf-8') # Decode bytes to string for JSON
-    #         logging.debug("Extracted and serialized app public key PEM for registration.")
-    #     except FileNotFoundError:
-    #         logging.error(f"Cannot register user: App certificate file '{config.APP_CERT_FILE}' not found.")
-    #         return False
-    #     except (IOError, ValueError, TypeError) as e: # Catch parsing/serialization errors
-    #         logging.error(f"Cannot register user: Error processing app certificate/key: {e}")
-    #         return False
-        
-    #     message = {
-    #         "type": "REGISTER",
-    #         "sender_id": self.user_id,
-    #         "payload": {
-    #             "app_public_key_pem": app_public_key_pem # <-- Send the public key PEM
-    #         }
-    #     }
-
-    #     # NOTE (AUTH): No signature added here in current placeholder structure,
-    #     #   assuming server trusts initial registration or uses an out-of-band verification.
-
-    #     response = self._send_and_receive(self.server_addr, message) # Uses TLS backend connection
-    #     if response and response.get("type") == "REGISTER_ACK":
-    #         logging.info("Registration successful!")
-    #         return True
-    #     else:
-    #         error = response.get("payload", {}).get("error", "Unknown error") if response else "No response/comm error"
-    #         logging.error(f"Registration failed: {error}")
-    #         return False
-
     def check_license_status(self):
         """Checks the user's driving license status with the server."""
         logging.info("Checking license status with the backend server...")
@@ -548,7 +598,7 @@ class AppClient:
             logging.error(f"Failed to check license status.")
             return None
 
-    # --- New Car Management Functions ---
+    # --- Car Management Functions ---
     def register_car(self, car_id: str, model: str = "My Car"):
         """Registers a car with the server (associates it with current user as owner)."""
         logging.info(f"Attempting to register car '{car_id}' with owner '{self.user_id}'...")
@@ -568,7 +618,6 @@ class AppClient:
         except IOError as e:
             logging.error(f"Cannot register car: Error reading car certificate file: {e}")
             return False
-        # -------------------------------------------
 
         message = {
             "type": "REGISTER_CAR",
@@ -777,7 +826,7 @@ def run_cli(client: AppClient):
 
         time.sleep(0.1)
 
-
+# --- Main Execution Block ---
 if __name__ == "__main__":
     # --- New Login/Signup Loop ---
     logged_in_user_id = None
@@ -790,6 +839,10 @@ if __name__ == "__main__":
 
         if auth_choice == '1':
             user_id = input("Enter desired User ID: ")
+            # Basic validation for CN characters might be needed in real life
+            if not user_id or not user_id.isalnum(): # Simple check
+                 print("Invalid User ID format (use letters/numbers only).")
+                 continue
             while True:
                 pin = getpass.getpass("Enter 4-digit PIN: ") # Hidden input
                 if len(pin) == 4 and pin.isdigit():
@@ -806,7 +859,10 @@ if __name__ == "__main__":
                 continue
 
             if signup_with_server(user_id, pin):
-                print(f"Signup successful for {user_id}. Please log in.")
+                print(f"Signup successful for {user_id}. User Certificate/Key generated.")
+                print(f"Cert: {config.get_user_cert_path(user_id)}")
+                print(f"Key: {config.get_user_key_path(user_id)}")
+                print("Please log in.")
                 # Automatically log in after signup? Or force login? Let's force login for now.
             else:
                 print("Signup failed. Please check logs or try a different User ID.")
@@ -840,6 +896,7 @@ if __name__ == "__main__":
     if logged_in_user_id:
         print(f"\nStarting app client for authenticated user: {logged_in_user_id}")
         try:
+            # Initialize AppClient AFTER login, using the logged-in user ID
             app_client = AppClient(logged_in_user_id)
             run_cli(app_client) # Start the main application menu
         except SystemExit as e:
