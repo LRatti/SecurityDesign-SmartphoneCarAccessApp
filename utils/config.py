@@ -61,6 +61,13 @@ PROVISIONING_APP_KEY_FILE = os.path.join(CERT_DIR, 'app-key.pem')
 SERVER_CERT_FILE = os.path.join(CERT_DIR, 'server-cert.pem')
 SERVER_KEY_FILE = os.path.join(CERT_DIR, 'server-key.pem')
 
+# Intermediate CA (NEW)
+INTERMEDIATE_CA_KEY_FILE = os.path.join(CERT_DIR, 'intermediate-ca-key.pem')
+INTERMEDIATE_CA_CERT_FILE = os.path.join(CERT_DIR, 'intermediate-ca-cert.pem')
+
+# Intermediate CA Chain (if applicable) (NEW)
+CA_CHAIN_FILE = os.path.join(CERT_DIR, 'ca-chain.pem')
+
 # Check if files exist (optional, but good for debugging setup)
 if not os.path.exists(CA_CERT_FILE):
     print(f"Warning: CA Certificate not found at {CA_CERT_FILE}")

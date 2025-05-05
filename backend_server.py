@@ -33,16 +33,16 @@ def load_ca_credentials():
     if CA_CERT and CA_KEY:
         return True
     try:
-        logging.info(f"Loading CA Certificate from: {config.CA_CERT_FILE}")
-        with open(config.CA_CERT_FILE, "rb") as f:
-            ca_cert_pem = f.read()
-        CA_CERT = x509.load_pem_x509_certificate(ca_cert_pem, default_backend())
+        logging.info(f"Loading Intermediate CA Certificate from: {config.INTERMEDIATE_CA_CERT_FILE}")
+        with open(config.INTERMEDIATE_CA_CERT_FILE, "rb") as f:
+            int_ca_cert_pem = f.read()
+        CA_CERT = x509.load_pem_x509_certificate(int_ca_cert_pem, default_backend())
 
-        logging.info(f"Loading CA Private Key from: {config.CA_KEY_FILE}")
-        with open(config.CA_KEY_FILE, "rb") as f:
-            ca_key_pem = f.read()
+        logging.info(f"Loading Intermediate CA Private Key from: {config.INTERMEDIATE_CA_KEY_FILE}")
+        with open(config.INTERMEDIATE_CA_KEY_FILE, "rb") as f:
+            int_ca_key_pem = f.read()
         # IMPORTANT: Provide password=None if key is not encrypted
-        CA_KEY = serialization.load_pem_private_key(ca_key_pem, password=None, backend=default_backend())
+        CA_KEY = serialization.load_pem_private_key(int_ca_key_pem, password=None, backend=default_backend())
         logging.info("CA Certificate and Key loaded successfully.")
         return True
     except FileNotFoundError as e:
@@ -118,9 +118,9 @@ class BackendServer:
             logging.info(f"Loading SERVER cert chain: {config.SERVER_CERT_FILE}, {config.SERVER_KEY_FILE}")
             context.load_cert_chain(certfile=config.SERVER_CERT_FILE, keyfile=config.SERVER_KEY_FILE)
             
-            logging.info(f"Loading CA cert for client (app) verification: {config.CA_CERT_FILE}")
-            # Require client certificate and verify it against our CA
-            context.load_verify_locations(cafile=config.CA_CERT_FILE)
+            logging.info(f"Loading CA chain for client (app) verification: {config.CA_CHAIN_FILE}")
+            # Require client certificate and verify it against our CA chain (Intermediate + Root)
+            context.load_verify_locations(cafile=config.CA_CHAIN_FILE)
             # CERT_REQUIRED ensures *some* valid client cert is presented
             context.verify_mode = ssl.CERT_REQUIRED # Require app client cert
 

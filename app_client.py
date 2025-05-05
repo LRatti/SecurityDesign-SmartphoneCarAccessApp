@@ -30,7 +30,8 @@ def create_provisioning_ssl_context():
         context.load_cert_chain(certfile=config.PROVISIONING_APP_CERT_FILE,
                                 keyfile=config.PROVISIONING_APP_KEY_FILE)
         # Uses CA cert to verify BACKEND SERVER's cert
-        context.load_verify_locations(cafile=config.CA_CERT_FILE)
+        # context.load_verify_locations(cafile=config.CA_CERT_FILE)
+        context.load_verify_locations(cafile=config.CA_CHAIN_FILE)
         context.verify_mode = ssl.CERT_REQUIRED
         context.check_hostname = False # As before
         if not context.check_hostname:
@@ -60,7 +61,8 @@ def create_user_ssl_context(user_id: str):
         # Uses USER-SPECIFIC cert/key
         context.load_cert_chain(certfile=user_cert_file, keyfile=user_key_file)
         # Uses CA cert to verify server cert (Backend or Car)
-        context.load_verify_locations(cafile=config.CA_CERT_FILE)
+        # context.load_verify_locations(cafile=config.CA_CERT_FILE)
+        context.load_verify_locations(cafile=config.CA_CHAIN_FILE)
         context.verify_mode = ssl.CERT_REQUIRED
         context.check_hostname = False # As before for backend/car
         if not context.check_hostname:
@@ -276,7 +278,8 @@ class AppClient:
             context.load_cert_chain(certfile=user_cert_file, keyfile=user_key_file)
 
             logging.info(f"Loading CA cert for CAR server verification: {config.CA_CERT_FILE}")
-            context.load_verify_locations(cafile=config.CA_CERT_FILE)
+            # context.load_verify_locations(cafile=config.CA_CERT_FILE)
+            context.load_verify_locations(cafile=config.CA_CHAIN_FILE)
             context.verify_mode = ssl.CERT_REQUIRED
             context.check_hostname = False # As before for car
             if not context.check_hostname:
