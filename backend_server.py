@@ -452,6 +452,21 @@ class BackendServer:
                 # Avoid distinguishing between user not found and bad PIN for security
                 response.update({"type": "LOGIN_NAK", "payload": {"error": "Invalid user ID or PIN"}})
         
+        elif msg_type == "CHECK_LICENSE":
+                # TODO (AUTH): Verify signature from 'sender_id' on the payload/message content.
+                # signature = message.get('signature')
+                # data_signed = json.dumps(payload) # Or however the app signs it
+                # if not verify_user_signature(sender_id, data_signed, signature):
+                #     return {"type": "ERROR", "payload": {"error": "Invalid signature"}}
+                sender_id = message.get('sender_id') # Get sender_id from message now
+                if not sender_id: return {"type": "ERROR", "payload": {"error": "Missing sender_id for CHECK_LICENSE"}}
+                with self.user_lock:
+                    user_data = self.users.get(sender_id)
+                if user_data:
+                    is_valid = user_data.get('license_valid', False)
+                    response.update({"type": "LICENSE_STATUS", "payload": {"user_id": sender_id, "is_valid": is_valid}})
+                else:
+                    response.update({"type": "LICENSE_STATUS", "payload": {"error": "User not registered", "user_id": sender_id, "is_valid": False}})
 
 
 
@@ -631,60 +646,6 @@ class BackendServer:
                 # Send a generic error response back to the client if possible
                 response.update({"type": "REGISTER_CAR_NAK", "payload": {"error": f"Server internal error during registration: {e}"}})
                 # Note: The connection might already be broken if the exception was severe
-        # --- Delegation Management ---
-#             elif msg_type == "DELEGATE_ACCESS":
-#                 # TODO (AUTH): Verify signature from 'sender_id' (owner) on the payload. Crucial.
-#                 # signature = message.get('signature')
-#                 # data_signed = json.dumps(payload)
-#                 # if not verify_user_signature(sender_id, data_signed, signature):
-#                 #     return {"type": "DELEGATE_NAK", "payload": {"error": "Invalid signature for delegation"}}
-#                 sender_id = message.get('sender_id') # Owner performing delegation
-#                 # sender_id here MUST be the owner initiating the delegation
-#                 if not sender_id: return {"type": "ERROR", "payload": {"error": "Missing sender_id (owner) for DELEGATE_ACCESS"}}
-#                 car_id = payload.get('car_id')
-#                 recipient_user_id = payload.get('recipient_user_id')
-#                 permissions = payload.get('permissions', [])
-#                 duration_seconds = payload.get('duration_seconds', 3600) # Default 1 hour
-
-#                 if not car_id or not recipient_user_id or not permissions:
-#                     response.update({"type": "DELEGATE_NAK", "payload": {"error": "Missing car_id, recipient_user_id, or permissions"}})
-#                 else:
-#                     # Validate permissions
-#                     if not all(p in config.VALID_PERMISSIONS for p in permissions):
-#                         response.update({"type": "DELEGATE_NAK", "payload": {"error": f"Invalid permissions specified. Valid: {config.VALID_PERMISSIONS}"}})
-#                     else:
-#                         # Check ownership
-#                         with self.car_lock:
-#                             car_info = self.cars.get(car_id)
-#                         if not car_info:
-#                             response.update({"type": "DELEGATE_NAK", "payload": {"error": f"Car '{car_id}' not registered"}})
-#                         elif car_info.get('owner_user_id') != sender_id:
-#                             response.update({"type": "DELEGATE_NAK", "payload": {"error": f"User '{sender_id}' does not own car '{car_id}'"}})
-#                         else:
-#                             # Check if recipient exists
-#                             with self.user_lock:
-#                                 if recipient_user_id not in self.users:
-#                                     response.update({"type": "DELEGATE_NAK", "payload": {"error": f"Recipient user '{recipient_user_id}' not registered"}})
-#                                 else:
-#                                     # Create delegation
-#                                     delegation_id = str(uuid.uuid4())
-#                                     expiry_timestamp = time.time() + duration_seconds
-#                                     delegation_record = {
-#                                         'delegation_id': delegation_id, # Add for easier lookup if needed
-#                                         'car_id': car_id,
-#                                         'owner_user_id': sender_id,
-#                                         'recipient_user_id': recipient_user_id,
-#                                         'permissions': permissions,
-#                                         'expiry_timestamp': expiry_timestamp,
-#                                         'status': 'active'
-#                                     }
-#                                     with self.delegation_lock:
-#                                         self.delegations[delegation_id] = delegation_record
-#                                         delegations_copy = self.delegations.copy() # Save copy
-#                                     self._save_json(config.DELEGATIONS_FILE, self.delegations, "delegations")
-
-#                                     response.update({"type": "DELEGATE_ACK", "payload": {"status": "OK", "delegation_id": delegation_id, "expires_at": expiry_timestamp}})
-#                                     logging.info(f"Delegation {delegation_id} created by {sender_id} for {recipient_user_id} on {car_id}.")
 
         elif msg_type == "REVOKE_DELEGATION":
             # TODO (AUTH): Verify signature from 'sender_id' (owner) on the payload. Crucial.
@@ -710,7 +671,7 @@ class BackendServer:
                     else:
                         delegation['status'] = 'revoked'
                         delegations_copy = self.delegations.copy() # Save copy
-                        self._save_json(config.DELEGATIONS_FILE, self.delegations, "delegations")
+                        self._save_json(config.DELEGATIONS_FILE, delegations_copy, "delegations")
                         response.update({"type": "REVOKE_DELEGATION_ACK", "payload": {"status": "OK", "delegation_id": delegation_id}})
                         logging.info(f"Delegation '{delegation_id}' revoked by owner '{sender_id}'.")
         
