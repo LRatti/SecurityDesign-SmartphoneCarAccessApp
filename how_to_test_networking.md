@@ -35,13 +35,29 @@ Before running the servers, you must generate the required certificates and priv
     openssl genpkey -algorithm RSA -out certs/ca-key.pem -pkeyopt rsa_keygen_bits:2048
     openssl req -new -x509 -key certs/ca-key.pem -out certs/ca-cert.pem -days 3650 -subj "/CN=My Test CA"
 
-    # --- 2. Create Backend Server Key and CSR ---
+    # --- 2.1 Create Backend Server Key and CSR ---
     openssl genpkey -algorithm RSA -out certs/backend-key.pem -pkeyopt rsa_keygen_bits:2048
     # CN should match how clients connect (use localhost for this demo).
     openssl req -new -key certs/backend-key.pem -out certs/backend-csr.pem -subj "/CN=localhost"
 
-    # --- 3. Sign Backend Server Certificate with CA ---
+    # --- 2.2 Create Backend Server Intermediate Key and CSR ---
+    openssl genpkey -algorithm RSA -out certs/intermediate-ca-key.pem -pkeyopt rsa_keygen_bits:2048
+    openssl req -new -key certs/intermediate-ca-key.pem -out certs/intermediate-ca-csr.pem -subj "/CN=Intermediate CA for User Certificates"
+    
+    # --- 3.1 Sign Backend Server Certificate with CA ---
     openssl x509 -req -in certs/backend-csr.pem -CA certs/ca-cert.pem -CAkey certs/ca-key.pem -CAcreateserial -out certs/backend-cert.pem -days 365
+
+    # --- 3.2 Sign Backend Server Intermediate Certificate with Root CA ---
+    openssl x509 -req -in certs/intermediate-ca-csr.pem \
+    -CA certs/ca-cert.pem \
+    -CAkey certs/ca-key.pem \
+    -CAcreateserial \
+    -out certs/intermediate-ca-cert.pem \
+    -days 365 \
+    -extfile certs/v3_intermediate_ca.ext
+
+    # --- 3.3 Create the Chain CA
+    cat certs/intermediate-ca-cert.pem certs/ca-cert.pem > certs/ca-chain.pem
 
     # --- 4. Create Car Server Key and CSR ---
     openssl genpkey -algorithm RSA -out certs/car-key.pem -pkeyopt rsa_keygen_bits:2048
