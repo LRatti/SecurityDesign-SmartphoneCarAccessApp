@@ -546,92 +546,92 @@ class BackendServer:
 
 
 
-            # --- Car Management ---
-            elif msg_type == "REGISTER_CAR":
-                try:
-                    # TODO (AUTH): Verify signature from 'sender_id' (the owner) on the payload.
-                    #   This proves the user authorized adding this car under their name.
-                    # signature = message.get('signature')
-                    # data_signed = json.dumps(payload)
-                    # if not verify_user_signature(sender_id, data_signed, signature):
-                    
-                    sender_id = message.get('sender_id') # Get sender_id from message
-                    if not sender_id: return {"type": "ERROR", "payload": {"error": "Missing sender_id for REGISTER_CAR"}}
-                    if is_provisioning_connection: # Ensure it's not the provisioning cert
-                        logging.warning(f"Rejecting '{msg_type}' from provisioning connection.")
-                        return {"type": "ERROR", "payload": {"error": "Action requires authenticated user session"}}
-                    if client_cn != sender_id:
-                        logging.warning(f"{msg_type} failed: TLS CN '{client_cn}' != sender_id '{sender_id}'.")
-                        return {"type": "ERROR", "payload": {"error": "Certificate identity mismatch"}}
-                    # In POC, any registered user can register a car. In reality, needs admin/verification.
-                    car_id = payload.get('car_id')
-                    owner_user_id = payload.get('owner_user_id')
-                    # --- Expect the full certificate PEM now ---
-                    car_certificate_pem = payload.get('car_certificate_pem')
-                    model = payload.get('model', "Unknown Model")
-                    logging.debug(f"REGISTER_CAR: Processing for car '{car_id}', owner '{owner_user_id}'") # Add logging
+        # --- Car Management ---
+        elif msg_type == "REGISTER_CAR":
+            try:
+                # TODO (AUTH): Verify signature from 'sender_id' (the owner) on the payload.
+                #   This proves the user authorized adding this car under their name.
+                # signature = message.get('signature')
+                # data_signed = json.dumps(payload)
+                # if not verify_user_signature(sender_id, data_signed, signature):
+                
+                sender_id = message.get('sender_id') # Get sender_id from message
+                if not sender_id: return {"type": "ERROR", "payload": {"error": "Missing sender_id for REGISTER_CAR"}}
+                if is_provisioning_connection: # Ensure it's not the provisioning cert
+                    logging.warning(f"Rejecting '{msg_type}' from provisioning connection.")
+                    return {"type": "ERROR", "payload": {"error": "Action requires authenticated user session"}}
+                if client_cn != sender_id:
+                    logging.warning(f"{msg_type} failed: TLS CN '{client_cn}' != sender_id '{sender_id}'.")
+                    return {"type": "ERROR", "payload": {"error": "Certificate identity mismatch"}}
+                # In POC, any registered user can register a car. In reality, needs admin/verification.
+                car_id = payload.get('car_id')
+                owner_user_id = payload.get('owner_user_id')
+                # --- Expect the full certificate PEM now ---
+                car_certificate_pem = payload.get('car_certificate_pem')
+                model = payload.get('model', "Unknown Model")
+                logging.debug(f"REGISTER_CAR: Processing for car '{car_id}', owner '{owner_user_id}'") # Add logging
 
-                    if not car_id or not owner_user_id or not car_certificate_pem:
-                        response.update({"type": "REGISTER_CAR_NAK", "payload": {"error": "Missing car_id, owner_user_id, or car_certificate_pem"}})
-                    elif sender_id != owner_user_id: # Ensure the authenticated user is the one claiming ownership
-                        response.update({"type": "REGISTER_CAR_NAK", "payload": {"error": f"Authenticated user '{sender_id}' does not match owner '{owner_user_id}'"}})
+                if not car_id or not owner_user_id or not car_certificate_pem:
+                    response.update({"type": "REGISTER_CAR_NAK", "payload": {"error": "Missing car_id, owner_user_id, or car_certificate_pem"}})
+                elif sender_id != owner_user_id: # Ensure the authenticated user is the one claiming ownership
+                    response.update({"type": "REGISTER_CAR_NAK", "payload": {"error": f"Authenticated user '{sender_id}' does not match owner '{owner_user_id}'"}})
+                else:
+                    # Calculate fingerprint from provided PEM
+                    logging.debug("Calculating fingerprint...")
+                    fingerprint = self._calculate_fingerprint_from_pem(car_certificate_pem)
+                    logging.debug(f"Fingerprint result: {fingerprint}")   
+                    if not fingerprint:
+                        response.update({"type": "REGISTER_CAR_NAK", "payload": {"error": "Invalid car certificate format provided"}})
                     else:
-                        # Calculate fingerprint from provided PEM
-                        logging.debug("Calculating fingerprint...")
-                        fingerprint = self._calculate_fingerprint_from_pem(car_certificate_pem)
-                        logging.debug(f"Fingerprint result: {fingerprint}")   
-                        if not fingerprint:
-                            response.update({"type": "REGISTER_CAR_NAK", "payload": {"error": "Invalid car certificate format provided"}})
-                        else:
-                            # Check if owner exists    
-                            logging.debug("Checking owner existence...") # Add logging
-                            with self.user_lock:
-                                need_to_save = False # Flag to indicate if save is needed
-                                cars_copy = None     # Variable to hold data for saving
-                                if owner_user_id not in self.users:
-                                    response.update({"type": "REGISTER_CAR_NAK", "payload": {"error": f"Owner user '{owner_user_id}' not registered"}})
-                                else:
-                                    logging.debug(f"Owner '{owner_user_id}' exists.") # Add logging
-                                    # --- Add Duplicate Car Check HERE ---
-                                    # Proceed with registration
-                                    with self.car_lock:
-                                        if car_id in self.cars:
-                                            # Car ID already exists! Reject the registration.
-                                            logging.warning(f"Attempt to register duplicate car ID: {car_id}")
-                                            response.update({
-                                                "type": "REGISTER_CAR_NAK",
-                                                "payload": {"error": f"Car ID '{car_id}' is already registered."}
-                                            })
-                                            # No need to save, need_to_save remains False
-                                        else:
-                                            # Car ID is unique, proceed with registration
-                                            logging.info(f"Registering NEW car '{car_id}' with fingerprint: {fingerprint}")
-                                            self.cars[car_id] = {
-                                                'owner_user_id': owner_user_id,
-                                                'model': model,
-                                                'certificate_fingerprint_sha256': fingerprint,
-                                            }
-                                            cars_copy = self.cars.copy() # Prepare data for saving
-                                            need_to_save = True          # Set flag to save
-                                            # Set success response only if added
-                                            response.update({
-                                                "type": "REGISTER_CAR_ACK",
-                                                "payload": {"status": "OK", "car_id": car_id, "owner": owner_user_id}
-                                            })
-                                        # --- Save outside the lock, only if needed ---
-                                    if need_to_save and (cars_copy is not None):
-                                        logging.debug("Attempting to save cars data...")
-                                        self._save_json(config.CARS_FILE, cars_copy, "cars")
-                                        # Logging success message can happen after successful save or earlier
-                                        logging.info(f"Car '{car_id}' registered successfully for owner '{owner_user_id}'.")
-                                    elif response.get("type") == "REGISTER_CAR_NAK":
-                                        logging.info(f"Car '{car_id}' registration failed: {response.get('payload',{}).get('error')}")
-                except Exception as e: # <--- Add except block
-                    logging.error(f"!!! Unhandled exception during REGISTER_CAR processing: {e}", exc_info=True) # Log the full traceback
-                    # Send a generic error response back to the client if possible
-                    response.update({"type": "REGISTER_CAR_NAK", "payload": {"error": f"Server internal error during registration: {e}"}})
-                    # Note: The connection might already be broken if the exception was severe
-            # --- Delegation Management ---
+                        # Check if owner exists    
+                        logging.debug("Checking owner existence...") # Add logging
+                        with self.user_lock:
+                            need_to_save = False # Flag to indicate if save is needed
+                            cars_copy = None     # Variable to hold data for saving
+                            if owner_user_id not in self.users:
+                                response.update({"type": "REGISTER_CAR_NAK", "payload": {"error": f"Owner user '{owner_user_id}' not registered"}})
+                            else:
+                                logging.debug(f"Owner '{owner_user_id}' exists.") # Add logging
+                                # --- Add Duplicate Car Check HERE ---
+                                # Proceed with registration
+                                with self.car_lock:
+                                    if car_id in self.cars:
+                                        # Car ID already exists! Reject the registration.
+                                        logging.warning(f"Attempt to register duplicate car ID: {car_id}")
+                                        response.update({
+                                            "type": "REGISTER_CAR_NAK",
+                                            "payload": {"error": f"Car ID '{car_id}' is already registered."}
+                                        })
+                                        # No need to save, need_to_save remains False
+                                    else:
+                                        # Car ID is unique, proceed with registration
+                                        logging.info(f"Registering NEW car '{car_id}' with fingerprint: {fingerprint}")
+                                        self.cars[car_id] = {
+                                            'owner_user_id': owner_user_id,
+                                            'model': model,
+                                            'certificate_fingerprint_sha256': fingerprint,
+                                        }
+                                        cars_copy = self.cars.copy() # Prepare data for saving
+                                        need_to_save = True          # Set flag to save
+                                        # Set success response only if added
+                                        response.update({
+                                            "type": "REGISTER_CAR_ACK",
+                                            "payload": {"status": "OK", "car_id": car_id, "owner": owner_user_id}
+                                        })
+                                    # --- Save outside the lock, only if needed ---
+                                if need_to_save and (cars_copy is not None):
+                                    logging.debug("Attempting to save cars data...")
+                                    self._save_json(config.CARS_FILE, cars_copy, "cars")
+                                    # Logging success message can happen after successful save or earlier
+                                    logging.info(f"Car '{car_id}' registered successfully for owner '{owner_user_id}'.")
+                                elif response.get("type") == "REGISTER_CAR_NAK":
+                                    logging.info(f"Car '{car_id}' registration failed: {response.get('payload',{}).get('error')}")
+            except Exception as e: # <--- Add except block
+                logging.error(f"!!! Unhandled exception during REGISTER_CAR processing: {e}", exc_info=True) # Log the full traceback
+                # Send a generic error response back to the client if possible
+                response.update({"type": "REGISTER_CAR_NAK", "payload": {"error": f"Server internal error during registration: {e}"}})
+                # Note: The connection might already be broken if the exception was severe
+        # --- Delegation Management ---
 #             elif msg_type == "DELEGATE_ACCESS":
 #                 # TODO (AUTH): Verify signature from 'sender_id' (owner) on the payload. Crucial.
 #                 # signature = message.get('signature')
@@ -686,66 +686,66 @@ class BackendServer:
 #                                     response.update({"type": "DELEGATE_ACK", "payload": {"status": "OK", "delegation_id": delegation_id, "expires_at": expiry_timestamp}})
 #                                     logging.info(f"Delegation {delegation_id} created by {sender_id} for {recipient_user_id} on {car_id}.")
 
-            elif msg_type == "REVOKE_DELEGATION":
-                # TODO (AUTH): Verify signature from 'sender_id' (owner) on the payload. Crucial.
-                # signature = message.get('signature')
-                # data_signed = json.dumps(payload)
-                # if not verify_user_signature(sender_id, data_signed, signature):
-                #     return {"type": "REVOKE_DELEGATION_NAK", "payload": {"error": "Invalid signature for revocation"}}
-                sender_id = message.get('sender_id') # Owner performing delegation
-                # sender_id MUST be the owner
-                if not sender_id: return {"type": "ERROR", "payload": {"error": "Missing sender_id (owner) for REVOKE_DELEGATION"}}
-                delegation_id = payload.get('delegation_id')
-                if not delegation_id:
-                    response.update({"type": "REVOKE_DELEGATION_NAK", "payload": {"error": "Missing delegation_id"}})
-                else:
-                    with self.delegation_lock:
-                        delegation = self.delegations.get(delegation_id)
-                        if not delegation:
-                            response.update({"type": "REVOKE_DELEGATION_NAK", "payload": {"error": "Delegation not found"}})
-                        elif delegation['owner_user_id'] != sender_id:
-                            response.update({"type": "REVOKE_DELEGATION_NAK", "payload": {"error": "Only the owner can revoke"}})
-                        elif delegation['status'] != 'active':
-                            response.update({"type": "REVOKE_DELEGATION_NAK", "payload": {"error": f"Delegation already {delegation['status']}"}})
-                        else:
-                            delegation['status'] = 'revoked'
-                            delegations_copy = self.delegations.copy() # Save copy
-                            self._save_json(config.DELEGATIONS_FILE, self.delegations, "delegations")
-                            response.update({"type": "REVOKE_DELEGATION_ACK", "payload": {"status": "OK", "delegation_id": delegation_id}})
-                            logging.info(f"Delegation '{delegation_id}' revoked by owner '{sender_id}'.")
-            
-            # --- NEW: Certificate Validation (Called by App Client) ---
-            elif msg_type == "VALIDATE_CAR_CERT":
-                sender_id = message.get('sender_id') # Owner performing delegation
-
-                # This request comes from the App Client (sender_id is user_id)
-                if not sender_id: return {"type": "ERROR", "payload": {"error": "Missing sender_id (user) for VALIDATE_CAR_CERT"}}
-
-                car_id_to_validate = payload.get('car_id')
-                received_fingerprint = payload.get('certificate_fingerprint')
-
-                if not car_id_to_validate or not received_fingerprint:
-                    response.update({"type": "VALIDATE_CAR_CERT_NAK", "payload": {"error": "Missing car_id or certificate_fingerprint"}})
-                else:
-                    with self.car_lock:
-                        car_data = self.cars.get(car_id_to_validate)
-
-                    if not car_data:
-                        logging.warning(f"Validation failed: Car ID '{car_id_to_validate}' not found for user '{sender_id}'.")
-                        response.update({"type": "VALIDATE_CAR_CERT_NAK", "payload": {"car_id": car_id_to_validate, "status": "INVALID", "reason": "Car not registered"}})
+        elif msg_type == "REVOKE_DELEGATION":
+            # TODO (AUTH): Verify signature from 'sender_id' (owner) on the payload. Crucial.
+            # signature = message.get('signature')
+            # data_signed = json.dumps(payload)
+            # if not verify_user_signature(sender_id, data_signed, signature):
+            #     return {"type": "REVOKE_DELEGATION_NAK", "payload": {"error": "Invalid signature for revocation"}}
+            sender_id = message.get('sender_id') # Owner performing delegation
+            # sender_id MUST be the owner
+            if not sender_id: return {"type": "ERROR", "payload": {"error": "Missing sender_id (owner) for REVOKE_DELEGATION"}}
+            delegation_id = payload.get('delegation_id')
+            if not delegation_id:
+                response.update({"type": "REVOKE_DELEGATION_NAK", "payload": {"error": "Missing delegation_id"}})
+            else:
+                with self.delegation_lock:
+                    delegation = self.delegations.get(delegation_id)
+                    if not delegation:
+                        response.update({"type": "REVOKE_DELEGATION_NAK", "payload": {"error": "Delegation not found"}})
+                    elif delegation['owner_user_id'] != sender_id:
+                        response.update({"type": "REVOKE_DELEGATION_NAK", "payload": {"error": "Only the owner can revoke"}})
+                    elif delegation['status'] != 'active':
+                        response.update({"type": "REVOKE_DELEGATION_NAK", "payload": {"error": f"Delegation already {delegation['status']}"}})
                     else:
-                        expected_fingerprint = car_data.get('certificate_fingerprint_sha256')
-                        if not expected_fingerprint:
-                            # This shouldn't happen if registration is correct
-                            logging.error(f"Internal Error: Missing stored fingerprint for car '{car_id_to_validate}'.")
-                            response.update({"type": "VALIDATE_CAR_CERT_NAK", "payload": {"car_id": car_id_to_validate, "status": "INVALID", "reason": "Server internal error: fingerprint missing"}})
-                        elif received_fingerprint == expected_fingerprint:
-                            logging.info(f"Certificate validation SUCCESS for car '{car_id_to_validate}' requested by user '{sender_id}'. Fingerprint: {received_fingerprint}")
-                            response.update({"type": "VALIDATE_CAR_CERT_ACK", "payload": {"car_id": car_id_to_validate, "status": "VALID"}})
-                        else:
-                            logging.warning(f"Certificate validation FAILED for car '{car_id_to_validate}' requested by user '{sender_id}'. Expected: {expected_fingerprint}, Received: {received_fingerprint}")
-                            response.update({"type": "VALIDATE_CAR_CERT_NAK", "payload": {"car_id": car_id_to_validate, "status": "INVALID", "reason": "Certificate fingerprint mismatch"}})
-            
+                        delegation['status'] = 'revoked'
+                        delegations_copy = self.delegations.copy() # Save copy
+                        self._save_json(config.DELEGATIONS_FILE, self.delegations, "delegations")
+                        response.update({"type": "REVOKE_DELEGATION_ACK", "payload": {"status": "OK", "delegation_id": delegation_id}})
+                        logging.info(f"Delegation '{delegation_id}' revoked by owner '{sender_id}'.")
+        
+        # --- NEW: Certificate Validation (Called by App Client) ---
+        elif msg_type == "VALIDATE_CAR_CERT":
+            sender_id = message.get('sender_id') # Owner performing delegation
+
+            # This request comes from the App Client (sender_id is user_id)
+            if not sender_id: return {"type": "ERROR", "payload": {"error": "Missing sender_id (user) for VALIDATE_CAR_CERT"}}
+
+            car_id_to_validate = payload.get('car_id')
+            received_fingerprint = payload.get('certificate_fingerprint')
+
+            if not car_id_to_validate or not received_fingerprint:
+                response.update({"type": "VALIDATE_CAR_CERT_NAK", "payload": {"error": "Missing car_id or certificate_fingerprint"}})
+            else:
+                with self.car_lock:
+                    car_data = self.cars.get(car_id_to_validate)
+
+                if not car_data:
+                    logging.warning(f"Validation failed: Car ID '{car_id_to_validate}' not found for user '{sender_id}'.")
+                    response.update({"type": "VALIDATE_CAR_CERT_NAK", "payload": {"car_id": car_id_to_validate, "status": "INVALID", "reason": "Car not registered"}})
+                else:
+                    expected_fingerprint = car_data.get('certificate_fingerprint_sha256')
+                    if not expected_fingerprint:
+                        # This shouldn't happen if registration is correct
+                        logging.error(f"Internal Error: Missing stored fingerprint for car '{car_id_to_validate}'.")
+                        response.update({"type": "VALIDATE_CAR_CERT_NAK", "payload": {"car_id": car_id_to_validate, "status": "INVALID", "reason": "Server internal error: fingerprint missing"}})
+                    elif received_fingerprint == expected_fingerprint:
+                        logging.info(f"Certificate validation SUCCESS for car '{car_id_to_validate}' requested by user '{sender_id}'. Fingerprint: {received_fingerprint}")
+                        response.update({"type": "VALIDATE_CAR_CERT_ACK", "payload": {"car_id": car_id_to_validate, "status": "VALID"}})
+                    else:
+                        logging.warning(f"Certificate validation FAILED for car '{car_id_to_validate}' requested by user '{sender_id}'. Expected: {expected_fingerprint}, Received: {received_fingerprint}")
+                        response.update({"type": "VALIDATE_CAR_CERT_NAK", "payload": {"car_id": car_id_to_validate, "status": "INVALID", "reason": "Certificate fingerprint mismatch"}})
+        
         elif msg_type in ["VALIDATE_APP_PUBKEY", "VALIDATE_ACCESS_ATTEMPT"]:
             # We need to identify if the connection is from a CAR.
             # This could be based on the CN of the car's certificate.
