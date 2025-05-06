@@ -1,2 +1,4 @@
 __pycache__
 .git
+certs\users
+data\server_data
