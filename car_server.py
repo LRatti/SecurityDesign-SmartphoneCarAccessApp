@@ -334,7 +334,6 @@ class CarServer:
         response = {"sender_id": self.car_id} # Initialize response
         # TODO (AUTH): Extract signature/auth_data from payload.
         #   auth_data = payload.get('auth_data') # Could be signature or signed nonce
-
         if not msg_type or not requesting_user_id:
             self._log(logging.WARNING, f"Received incomplete message: {message}")
             return {"type": "ERROR", "sender_id": self.car_id, "payload": {"error": "Incomplete message (missing type or sender_id)"}}
@@ -388,8 +387,6 @@ class CarServer:
             action_to_validate = config.PERMISSION_UNLOCK
             if self._validate_action_with_server(requesting_user_id, action_to_validate):
                 self.is_unlocked = True
-                self.is_started = False # Ensure started state is reset
-                self.started_by_user_id = None # Reset starter on unlock
                 response.update({"type": "UNLOCK_ACK", "payload": {"status": "Unlocked"}})
                 self._log(logging.INFO, f"Car unlocked by {requesting_user_id} (Validation OK)")
             else:
@@ -398,9 +395,13 @@ class CarServer:
 
         elif msg_type == "START_REQUEST":
             action_to_validate = config.PERMISSION_START
-            if not self.is_unlocked:
-                 response.update({"type": "START_NAK", "payload": {"error": "Car is locked"}})
-                 self._log(logging.WARNING, f"Start failed for {requesting_user_id} (Car locked)")
+            original_starter = self.started_by_user_id
+            if requesting_user_id != original_starter and self.is_started:
+                    response.update({"type": "START_NAK", "payload": {"error": "Car has already been started by " + original_starter}})
+                    self._log(logging.WARNING, f"Start failed for {requesting_user_id} (Car already started by other user)")
+            # elif not self.is_unlocked:
+            #      response.update({"type": "START_NAK", "payload": {"error": "Car is locked"}})
+            #      self._log(logging.WARNING, f"Start failed for {requesting_user_id} (Car locked)")
             elif self._validate_action_with_server(requesting_user_id, action_to_validate):
                  self.is_started = True
                  # --- Store the user who started the car ---
@@ -416,12 +417,10 @@ class CarServer:
         elif msg_type == "LOCK_REQUEST":
              action_to_validate = config.PERMISSION_UNLOCK # Require unlock permission to lock
              if self._validate_action_with_server(requesting_user_id, action_to_validate):
-                 original_starter = self.started_by_user_id # Log who started it, if anyone
                  self.is_unlocked = False
-                 self.is_started = False
-                 self.started_by_user_id = None # Reset starter on lock
                  response.update({"type": "LOCK_ACK", "payload": {"status": "Locked"}})
                  log_msg = f"Car locked by {requesting_user_id} (Validation OK)."
+                 original_starter = self.started_by_user_id
                  if original_starter:
                      log_msg += f" Car was previously started by {original_starter}."
                  self._log(logging.INFO, log_msg)

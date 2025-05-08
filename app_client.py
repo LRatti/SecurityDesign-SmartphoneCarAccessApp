@@ -676,30 +676,30 @@ class AppClient:
              logging.error(f"Delegation failed: {error}")
              return None
 
-    def revoke_delegation(self, delegation_id: str):
+    def revoke_delegation(self, delegation_id: str | None = None): # <-- Make delegation_id optional
          """Revokes a previously created delegation."""
-         if not delegation_id:
-             logging.error("No delegation ID provided to revoke.")
-             return False
-         logging.info(f"Attempting to revoke delegation ID: {delegation_id}...")
+         if delegation_id:
+             logging.info(f"Attempting to revoke specific delegation ID: {delegation_id}...")
+             payload_content = {"delegation_id": delegation_id}
+         else:
+             logging.info(f"Attempting to revoke user '{self.user_id}'s last active delegation (server-side determination)...")
+             payload_content = {} # Empty payload, server will figure it out
          message = {
             "type": "REVOKE_DELEGATION",
             "sender_id": self.user_id, # Must be owner
-            "payload": {
-                "delegation_id": delegation_id
-                # TODO (AUTH): Add signature to authenticate this revocation request.
-
-            }
+            "payload": payload_content
          }
-         response = self._send_and_receive(self.server_addr, message) # No target_car_id
+         response = self._send_and_receive(self.server_addr, message)
          if response and response.get("type") == "REVOKE_DELEGATION_ACK":
+             revoked_id = response.get("payload", {}).get("delegation_id", "Unknown")
              logging.info(f"Delegation '{delegation_id}' revoked successfully!")
              if self.last_delegation_id == delegation_id:
                  self.last_delegation_id = None
              return True
          else:
              error = response.get("payload", {}).get("error", "Unknown error") if response else "No response"
-             logging.error(f"Failed to revoke delegation '{delegation_id}': {error}")
+             action_type = f"specific delegation '{delegation_id}'" if delegation_id else "last active delegation"
+             logging.error(f"Failed to revoke {action_type}: {error}")
              return False
 
 
@@ -807,10 +807,14 @@ def run_cli(client: AppClient):
                 else:
                     print("Missing required info for delegation.")
             elif choice == '4':
-                 if client.last_delegation_id:
-                    client.revoke_delegation(client.last_delegation_id)
+                 # Now calls the modified revoke_delegation without an ID
+                 print("Attempting to revoke your last active delegation...")
+                 if client.revoke_delegation(): # No argument passed
+                     # Success message is already logged in the method
+                     pass
                  else:
-                    print("No delegation ID stored from the last 'delegate' action.")
+                     # Failure message is already logged
+                     print("Revocation failed or no active delegation to revoke. Check logs.")
             # --- Car Interaction Cases ---
             elif choice == '5':
                 # Ask for car ID if multiple cars are supported later
