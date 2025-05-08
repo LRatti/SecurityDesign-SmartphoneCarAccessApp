@@ -578,6 +578,7 @@ class BackendServer:
                                     'recipient_user_id': recipient_user_id,
                                     'permissions': permissions,
                                     'expiry_timestamp': expiry_timestamp,
+                                    'creation_timestamp': time.time(), # <-- ADD THIS LINE
                                     'status': 'active'
                                 }
                                 self.delegations[delegation_id] = delegation_record
@@ -692,33 +693,71 @@ class BackendServer:
                 # Note: The connection might already be broken if the exception was severe
 
         elif msg_type == "REVOKE_DELEGATION":
-            # TODO (AUTH): Verify signature from 'sender_id' (owner) on the payload. Crucial.
-            # signature = message.get('signature')
-            # data_signed = json.dumps(payload)
-            # if not verify_user_signature(sender_id, data_signed, signature):
-            #     return {"type": "REVOKE_DELEGATION_NAK", "payload": {"error": "Invalid signature for revocation"}}
-            sender_id = message.get('sender_id') # Owner performing delegation
-            # sender_id MUST be the owner
-            if not sender_id: return {"type": "ERROR", "payload": {"error": "Missing sender_id (owner) for REVOKE_DELEGATION"}}
-            delegation_id = payload.get('delegation_id')
-            if not delegation_id:
-                response.update({"type": "REVOKE_DELEGATION_NAK", "payload": {"error": "Missing delegation_id"}})
-            else:
-                with self.delegation_lock:
-                    delegation = self.delegations.get(delegation_id)
-                    if not delegation:
+            sender_id = message.get('sender_id')
+            if not sender_id:
+                return {"type": "ERROR", "payload": {"error": "Missing sender_id (owner) for REVOKE_DELEGATION"}}
+
+            delegation_id_to_revoke = payload.get('delegation_id') # Might be None
+
+            with self.delegation_lock:
+                delegation_to_revoke_obj = None
+                if delegation_id_to_revoke:
+                    # Specific delegation ID provided
+                    delegation_to_revoke_obj = self.delegations.get(delegation_id_to_revoke)
+                    if not delegation_to_revoke_obj:
                         response.update({"type": "REVOKE_DELEGATION_NAK", "payload": {"error": "Delegation not found"}})
-                    elif delegation['owner_user_id'] != sender_id:
-                        response.update({"type": "REVOKE_DELEGATION_NAK", "payload": {"error": "Only the owner can revoke"}})
-                    elif delegation['status'] != 'active':
-                        response.update({"type": "REVOKE_DELEGATION_NAK", "payload": {"error": f"Delegation already {delegation['status']}"}})
+                    elif delegation_to_revoke_obj['owner_user_id'] != sender_id:
+                        response.update({"type": "REVOKE_DELEGATION_NAK", "payload": {"error": "Only the owner can revoke this specific delegation"}})
+                    elif delegation_to_revoke_obj['status'] != 'active':
+                        response.update({"type": "REVOKE_DELEGATION_NAK", "payload": {"error": f"Delegation {delegation_id_to_revoke} already {delegation_to_revoke_obj['status']}"}})
                     else:
-                        delegation['status'] = 'revoked'
+                        # Fall through to revoke logic
+                        pass
+                else:
+                    # No specific delegation_id, find the user's last active one
+                    logging.info(f"Attempting to revoke last active delegation for user '{sender_id}'")
+                    user_active_delegations = []
+                    for d_id, d_obj in self.delegations.items():
+                        if d_obj['owner_user_id'] == sender_id and \
+                        d_obj['status'] == 'active' and \
+                        'creation_timestamp' in d_obj: # Ensure old records without timestamp are skipped or handled
+                            user_active_delegations.append(d_obj)
+
+                    if not user_active_delegations:
+                        response.update({"type": "REVOKE_DELEGATION_NAK", "payload": {"error": "No active delegations found for this user to revoke"}})
+                    else:
+                        # Sort by creation_timestamp descending to get the latest
+                        user_active_delegations.sort(key=lambda x: x['creation_timestamp'], reverse=True)
+                        delegation_to_revoke_obj = user_active_delegations[0]
+                        delegation_id_to_revoke = delegation_to_revoke_obj['delegation_id'] # Get the ID for logging/response
+                        logging.info(f"Identified last active delegation '{delegation_id_to_revoke}' for user '{sender_id}' to revoke.")
+                        # Fall through to revoke logic
+
+                # Common revocation logic
+                if "error" not in response.get("payload", {}): # If no error so far
+                    if delegation_to_revoke_obj: # Ensure we have an object to revoke
+                        delegation_to_revoke_obj['status'] = 'revoked'
                         delegations_copy = self.delegations.copy() # Save copy
-                        self._save_json(config.DELEGATIONS_FILE, delegations_copy, "delegations")
-                        response.update({"type": "REVOKE_DELEGATION_ACK", "payload": {"status": "OK", "delegation_id": delegation_id}})
-                        logging.info(f"Delegation '{delegation_id}' revoked by owner '{sender_id}'.")
-        
+                        # --- Save outside the lock for safety, but need to copy first ---
+                        # This save call should ideally be outside the lock to prevent holding it during I/O
+                        # For simplicity here, it's shown inside, but in a high-concurrency system, move it.
+                        # self._save_json(config.DELEGATIONS_FILE, delegations_copy, "delegations")
+                        response.update({"type": "REVOKE_DELEGATION_ACK",
+                                        "payload": {"status": "OK",
+                                                    "delegation_id": delegation_id_to_revoke, # Send back the ID of what was revoked
+                                                    "message": f"Delegation '{delegation_id_to_revoke}' revoked."}})
+                        logging.info(f"Delegation '{delegation_id_to_revoke}' revoked by owner '{sender_id}'.")
+                    elif not response.get("payload", {}).get("error"): # if no specific error set yet, but no object found
+                        response.update({"type": "REVOKE_DELEGATION_NAK", "payload": {"error": "Could not identify a delegation to revoke."}})
+
+
+            # Save data outside the lock if changes were made
+            if response.get("type") == "REVOKE_DELEGATION_ACK":
+                with self.delegation_lock: # Re-acquire for consistent copy
+                    delegations_copy_for_save = self.delegations.copy()
+                self._save_json(config.DELEGATIONS_FILE, delegations_copy_for_save, "delegations")
+
+                
         # --- NEW: Certificate Validation (Called by App Client) ---
         elif msg_type == "VALIDATE_CAR_CERT":
             sender_id = message.get('sender_id') # Owner performing delegation
