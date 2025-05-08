@@ -60,8 +60,8 @@ class BackendServer:
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
         # Data Stores (in-memory caches, loaded from files)
-        self.users = {} # user_id -> { 'public_key': '...', 'license_valid': True }
-        self.cars = {} # car_id -> { 'owner_user_id': '...', 'car_public_key': '...', 'model': '...' }
+        self.users = {} # user_id -> { 'certificate_fingerprint_sha256': '...', 'license_valid': True }
+        self.cars = {} # car_id -> { 'owner_user_id': '...', 'certificate_fingerprint_sha256': '...', 'model': '...' }
         self.delegations = {} # delegation_id -> { 'car_id': ..., 'owner_user_id': ..., 'recipient_user_id': ..., 'permissions': [...], 'expiry_timestamp': ..., 'status': 'active'/'revoked'/'expired' }
 
         # Locks for thread safety when accessing shared data
@@ -219,14 +219,26 @@ class BackendServer:
         client_cn = None
         client_public_key_pem = None # Store extracted key for potential use (less needed now)
         is_provisioning_cert = False # Flag if the generic cert was used
+        client_cert_der_for_processing = None # For passing to process_message
 
         # --- Log Client Cert Info ---
         try:
-            client_cert_details = ssl_client_socket.getpeercert()
-            if client_cert_details:
-                subject_dict = dict(x[0] for x in client_cert_details.get('subject', []))
+            client_cert_der = ssl_client_socket.getpeercert(binary_form=True) # Get DER form
+            if client_cert_der:
+                client_cert_der_for_processing = client_cert_der # Store for process_message
+                client_cert_obj = x509.load_der_x509_certificate(client_cert_der, default_backend())
+                
+                subject_dict = {attr.oid._name: attr.value for attr in client_cert_obj.subject}
                 client_cn = subject_dict.get('commonName')
                 logging.debug(f"App Client Cert Subject: {subject_dict}")
+
+                # Public key extraction (might be useful for other things, not directly for new login)
+                public_key = client_cert_obj.public_key()
+                client_public_key_pem = public_key.public_bytes(
+                     encoding=serialization.Encoding.PEM,
+                     format=serialization.PublicFormat.SubjectPublicKeyInfo
+                ).decode('utf-8')
+                logging.debug(f"Extracted App Client public key PEM from cert.")
 
                 # Check if it's the generic provisioning cert based on its CN
                 # Load the provisioning cert CN once for comparison
@@ -242,16 +254,22 @@ class BackendServer:
                 except Exception as cert_load_err:
                     logging.error(f"Failed to load provisioning cert for CN check: {cert_load_err}")
 
+            else: # Fallback to getpeercert() if binary_form fails or not available
+                client_cert_details = ssl_client_socket.getpeercert()
+                if client_cert_details:
+                    subject_dict_fallback = dict(x[0] for x in client_cert_details.get('subject', []))
+                    client_cn = subject_dict_fallback.get('commonName')
+
             # Extract public key PEM (might still be useful for logging/debugging)
-            client_cert_der = ssl_client_socket.getpeercert(binary_form=True)
-            if client_cert_der:
-                 client_cert_obj = x509.load_der_x509_certificate(client_cert_der, default_backend())
-                 public_key = client_cert_obj.public_key()
-                 client_public_key_pem = public_key.public_bytes(
-                     encoding=serialization.Encoding.PEM,
-                     format=serialization.PublicFormat.SubjectPublicKeyInfo
-                 ).decode('utf-8')
-                 logging.debug(f"Extracted App Client public key PEM from cert.")
+            # client_cert_der = ssl_client_socket.getpeercert(binary_form=True)
+            # if client_cert_der:
+            #      client_cert_obj = x509.load_der_x509_certificate(client_cert_der, default_backend())
+            #      public_key = client_cert_obj.public_key()
+            #      client_public_key_pem = public_key.public_bytes(
+            #          encoding=serialization.Encoding.PEM,
+            #          format=serialization.PublicFormat.SubjectPublicKeyInfo
+            #      ).decode('utf-8')
+            #      logging.debug(f"Extracted App Client public key PEM from cert.")
 
         except Exception as e:
              logging.warning(f"Error getting/processing peer certificate from App Client {address}: {e}")
@@ -265,7 +283,7 @@ class BackendServer:
                     break # Error or connection closed gracefully
 
                 # Pass client CN and provisioning flag for context
-                response = self.process_message(message, client_cn, is_provisioning_cert, client_public_key_pem)
+                response = self.process_message(message, client_cn, is_provisioning_cert, client_public_key_pem, client_cert_der_for_processing)                
                 
                 if response:
                     # Send response over the SSL socket
@@ -286,11 +304,13 @@ class BackendServer:
                 pass # Ignore if already closed
             ssl_client_socket.close()
 
-    def process_message(self, message: dict, client_cn: str | None, is_provisioning_connection: bool, client_cert_pubkey_pem: str | None) -> dict | None:
+    def process_message(self, message: dict, client_cn: str | None, is_provisioning_connection: bool, client_cert_pubkey_pem: str | None, client_cert_der: bytes | None) -> dict | None:        
         """Processes incoming messages and returns a response dictionary or None."""
         msg_type = message.get('type')
         sender_id_payload = message.get('sender_id') # User ID provided in payload (for some messages)
         payload = message.get('payload', {})
+        response = {"sender_id": "server"}
+
 
         # TODO (AUTH): Extract signature from message if present (e.g., signature = message.get('signature'))
 
@@ -354,11 +374,6 @@ class BackendServer:
                      logging.warning(f"CSR for user '{user_id}' is missing Common Name.")
                      return {"type": "SIGNUP_NAK", "payload": {"error": "CSR missing common name"}}
 
-                csr_public_key_pem = csr_public_key.public_bytes(
-                    encoding=serialization.Encoding.PEM,
-                    format=serialization.PublicFormat.SubjectPublicKeyInfo
-                ).decode('utf-8')
-
             except Exception as e:
                 logging.error(f"Failed to parse CSR for user '{user_id}': {e}")
                 return {"type": "SIGNUP_NAK", "payload": {"error": "Invalid CSR format"}}
@@ -388,9 +403,12 @@ class BackendServer:
 
 
                         new_certificate = builder.sign(CA_KEY, crypto_hashes.SHA256(), default_backend())
-                        new_certificate_pem = new_certificate.public_bytes(serialization.Encoding.PEM)
+                        new_certificate_pem_str = new_certificate.public_bytes(serialization.Encoding.PEM).decode('utf-8')
                         logging.info(f"Successfully signed certificate for user '{user_id}'.")
-
+                        user_cert_fingerprint = self._calculate_fingerprint_from_pem(new_certificate_pem_str)
+                        if not user_cert_fingerprint:
+                            logging.error(f"Failed to calculate fingerprint for newly signed cert for user '{user_id}'.")
+                            return {"type": "SIGNUP_NAK", "payload": {"error": "Server internal error: Cert processing failed"}}
                     except Exception as e:
                         logging.error(f"Failed to sign certificate for user '{user_id}': {e}")
                         return {"type": "SIGNUP_NAK", "payload": {"error": "Server internal error: Certificate signing failed"}}
@@ -399,7 +417,7 @@ class BackendServer:
                     salt = self._generate_salt()
                     pin_hash = self._hash_pin(pin, salt)
                     self.users[user_id] = {
-                        'public_key_pem': csr_public_key_pem, # Store user's public key PEM
+                        'certificate_fingerprint_sha256': user_cert_fingerprint,  # Store user's certificate fingerprint
                         'pin_salt': salt.hex(), # Store salt as hex string
                         'pin_hash': pin_hash,
                         'license_valid': True # Default license to valid on signup
@@ -408,18 +426,21 @@ class BackendServer:
 
             # Save outside lock
             self._save_json(config.REGISTRATION_FILE, users_copy, "user registrations")
-            logging.info(f"User '{user_id}' signed up successfully.")
-            response.update({"type": "SIGNUP_ACK", "payload": {"status": "OK", "user_id": user_id}})
-
-            # --- Send ACK with Certificate ---
+            logging.info(f"User '{user_id}' signed up successfully. Stored cert fingerprint.")
             response.update({
                 "type": "SIGNUP_ACK",
-                "payload": {
-                    "status": "OK",
-                    "user_id": user_id,
-                    "certificate_pem": new_certificate_pem.decode('utf-8') # Send back the signed cert
-                }
+                "payload": {"status": "OK", "user_id": user_id, "certificate_pem": new_certificate_pem_str}
             })
+
+            # --- Send ACK with Certificate ---
+            # response.update({
+            #     "type": "SIGNUP_ACK",
+            #     "payload": {
+            #         "status": "OK",
+            #         "user_id": user_id,
+            #         "certificate_pem": new_certificate_pem.decode('utf-8') # Send back the signed cert
+            #     }
+            # })
 
         # --- User Login ---
         elif msg_type == "LOGIN":
@@ -440,7 +461,29 @@ class BackendServer:
             if client_cn != user_id:
                  logging.warning(f"Login attempt failed: TLS CN '{client_cn}' does not match payload user ID '{user_id}'.")
                  return {"type": "LOGIN_NAK", "payload": {"error": "Certificate identity mismatch"}}
+            
+            if client_cert_der:
+                presented_cert_fingerprint = hashlib.sha256(client_cert_der).hexdigest()
+                with self.user_lock:
+                    user_data = self.users.get(user_id)
+                stored_fingerprint = user_data.get('certificate_fingerprint_sha256') if user_data else None
 
+                if not user_data: # Check if user exists first
+                    logging.warning(f"Login failed: User '{user_id}' not found.")
+                    return {"type": "LOGIN_NAK", "payload": {"error": "Invalid user ID or PIN"}}
+
+                if not stored_fingerprint or not hmac.compare_digest(presented_cert_fingerprint, stored_fingerprint):
+                    logging.warning(f"Login failed for user '{user_id}': Presented certificate fingerprint mismatch.")
+                    # For debugging:
+                    presented_fp_short = presented_cert_fingerprint[:10] if presented_cert_fingerprint else "N/A"
+                    stored_fp_short = stored_fingerprint[:10] if stored_fingerprint else "N/A"
+                    logging.debug(f"Presented FP (DER hash): {presented_fp_short}..., Stored FP: {stored_fp_short}...")
+                    return {"type": "LOGIN_NAK", "payload": {"error": "Invalid user ID or PIN"}} # Keep error generic
+                logging.info(f"Certificate fingerprint validated successfully for user '{user_id}'")
+            else:
+                logging.error(f"Login attempt for user '{user_id}' but client certificate DER not available.")
+                return {"type": "LOGIN_NAK", "payload": {"error": "Client certificate error"}}
+            
             if self._verify_pin(user_id, pin):
                 logging.info(f"User '{user_id}' logged in successfully.")
                 # Optionally fetch license status to send back
@@ -448,8 +491,7 @@ class BackendServer:
                     license_valid = self.users.get(user_id, {}).get('license_valid', False)
                 response.update({"type": "LOGIN_ACK", "payload": {"status": "OK", "user_id": user_id, "license_valid": license_valid}})
             else:
-                logging.warning(f"Login failed for user '{user_id}' (Invalid PIN or user not found).")
-                # Avoid distinguishing between user not found and bad PIN for security
+                logging.warning(f"Login failed for user '{user_id}' (Invalid PIN).")
                 response.update({"type": "LOGIN_NAK", "payload": {"error": "Invalid user ID or PIN"}})
         
         elif msg_type == "CHECK_LICENSE":
@@ -487,6 +529,8 @@ class BackendServer:
             if not car_id or not recipient_user_id or not permissions:
                 response.update({"type": "DELEGATE_NAK", "payload": {"error": "Missing car_id, recipient_user_id, or permissions"}})
             # --- Start: Added Validation Block ---
+            elif len(permissions) == 1 and permissions[0] == "START":
+                response.update({"type": "DELEGATE_NAK", "payload": {"error": "Invalid permissions specified. Needs 'UNLOCK' to 'START'."}})
             elif not all(p in config.VALID_PERMISSIONS for p in permissions):
                 response.update({"type": "DELEGATE_NAK", "payload": {"error": f"Invalid permissions specified. Valid: {config.VALID_PERMISSIONS}"}})
             else:
@@ -730,30 +774,41 @@ class BackendServer:
                 if not sender_id: return {"type": "ERROR", "payload": {"error": "Missing sender_id (car) for VALIDATE_APP_PUBKEY"}}
 
                 user_id_to_validate = payload.get('user_id_to_validate')
-                received_app_pubkey_pem = payload.get('app_public_key_pem')
+                # Expect 'app_certificate_pem' instead of 'app_public_key_pem'
+                received_app_cert_pem = payload.get('app_certificate_pem')
 
-                if not user_id_to_validate or not received_app_pubkey_pem:
-                    response.update({"type": "VALIDATE_APP_PUBKEY_NAK", "payload": {"error": "Missing user_id_to_validate or app_public_key_pem"}})
+                if not user_id_to_validate or not received_app_cert_pem:
+                    response.update({"type": "VALIDATE_APP_PUBKEY_NAK", "payload": {"error": "Missing user_id_to_validate or received_app_cert_pem"}})
                 else:
+                    # Calculate fingerprint from received app certificate PEM
+                    app_cert_fingerprint_to_validate = self._calculate_fingerprint_from_pem(received_app_cert_pem)
+                    if not app_cert_fingerprint_to_validate:
+                        logging.warning(f"App Cert Validation failed: Could not calculate fingerprint from PEM for user '{user_id_to_validate}'.")
+                        response.update({"type": "VALIDATE_APP_PUBKEY_NAK", "payload": {"user_id": user_id_to_validate, "status": "INVALID", "reason": "Invalid app certificate format"}})
+                        return response
+                    
                     with self.user_lock:
                         user_data = self.users.get(user_id_to_validate)
 
                     if not user_data:
-                        logging.warning(f"App PubKey Validation failed: User ID '{user_id_to_validate}' not found (req by car '{sender_id}').")
+                        logging.warning(f"App Cert Validation failed: User ID '{user_id_to_validate}' not found (req by car '{sender_id}').")
                         response.update({"type": "VALIDATE_APP_PUBKEY_NAK", "payload": {"user_id": user_id_to_validate, "status": "INVALID", "reason": "User not registered"}})
                     else:
-                        expected_pubkey_pem = user_data.get('public_key_pem')
-                        if not expected_pubkey_pem:
-                            logging.error(f"Internal Error: Missing stored public key PEM for user '{user_id_to_validate}'.")
-                            response.update({"type": "VALIDATE_APP_PUBKEY_NAK", "payload": {"user_id": user_id_to_validate, "status": "INVALID", "reason": "Server internal error: user public key missing"}})
+                        stored_user_cert_fingerprint = user_data.get('certificate_fingerprint_sha256')
+                        if not stored_user_cert_fingerprint:
+                            logging.error(f"Internal Error: Missing stored certificate fingerprint for user '{user_id_to_validate}'.")
+                            response.update({"type": "VALIDATE_APP_PUBKEY_NAK", "payload": {"user_id": user_id_to_validate, "status": "INVALID", "reason": "Server internal error: user certificate fingerprint missing"}})
                         # --- Direct String Comparison of PEMs ---
-                        elif received_app_pubkey_pem == expected_pubkey_pem:
-                            logging.info(f"App public key validation SUCCESS for user '{user_id_to_validate}' requested by car '{sender_id}'.")
+                        elif hmac.compare_digest(app_cert_fingerprint_to_validate, stored_user_cert_fingerprint):
+                            logging.info(f"App certificate validation SUCCESS for user '{user_id_to_validate}' requested by car '{sender_id}' Fingerprint: {app_cert_fingerprint_to_validate}.")
                             response.update({"type": "VALIDATE_APP_PUBKEY_ACK", "payload": {"user_id": user_id_to_validate, "status": "VALID"}})
                         else:
-                            logging.warning(f"App public key validation FAILED for user '{user_id_to_validate}' requested by car '{sender_id}'. Keys do not match.")
-                            # Don't log the keys themselves unless debugging heavily
-                            response.update({"type": "VALIDATE_APP_PUBKEY_NAK", "payload": {"user_id": user_id_to_validate, "status": "INVALID", "reason": "App public key mismatch"}})
+                            logging.warning(f"App certificate validation FAILED for user '{user_id_to_validate}' (req by car '{sender_id}'). Cert fingerprints mismatch.")
+                            # For debugging:
+                            presented_fp_short = app_cert_fingerprint_to_validate[:10] if app_cert_fingerprint_to_validate else "N/A"
+                            stored_fp_short = stored_user_cert_fingerprint[:10] if stored_user_cert_fingerprint else "N/A"
+                            logging.debug(f"Presented App Cert FP (from PEM): {presented_fp_short}..., Stored User Cert FP: {stored_fp_short}...")
+                            response.update({"type": "VALIDATE_APP_PUBKEY_NAK", "payload": {"user_id": user_id_to_validate, "status": "INVALID", "reason": "App certificate mismatch"}})
 
             # --- Access Validation (Called by Car Server) ---
             elif msg_type == "VALIDATE_ACCESS_ATTEMPT":
@@ -849,8 +904,8 @@ class BackendServer:
 
         # --- Unknown Message Type ---
         else:
-            lsender_id = message.get('sender_id', 'Unknown') # Attempt to get sender ID for logging
-            logging.warning(f"Received unknown message type '{msg_type}' from {sender_id}")
+            lsender_id = message.get('sender_id', 'Unknown')
+            logging.warning(f"Received unknown message type '{msg_type}' from {lsender_id}") # Corrected variable name
             response.update({"type": "ERROR", "payload": {"error": f"Unknown message type: {msg_type}"}})
 
         return response
