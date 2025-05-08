@@ -18,7 +18,7 @@ from cryptography.hazmat.backends import default_backend # <-- Add cryptography 
 from cryptography.hazmat.primitives import serialization
 from utils import config, network_utils 
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - Server - %(threadName)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - Server - %(threadName)s - %(levelname)s - %(message)s')
 
 # --- Hashing constants ---
 SALT_BYTES = 16
@@ -125,7 +125,7 @@ class BackendServer:
             context.verify_mode = ssl.CERT_REQUIRED # Require app client cert
 
             # Optional: Set specific TLS versions or cipher suites
-            # context.minimum_version = ssl.TLSVersion.TLSv1_3
+            context.minimum_version = ssl.TLSVersion.TLSv1_3
 
             logging.info("Backend Server SSL context created successfully for mTLS.")
             return context

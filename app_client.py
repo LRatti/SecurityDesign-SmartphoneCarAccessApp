@@ -18,7 +18,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 
 # -------------------------------------------------------------
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - AppClient - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - AppClient - %(levelname)s - %(message)s')
 
 # --- SSL Context Creation ---
 
