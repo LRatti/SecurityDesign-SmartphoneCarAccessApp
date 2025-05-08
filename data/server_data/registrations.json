@@ -6,5 +6,17 @@
     "furkan": {
         "public_key": "pubkey_for_furkan",
         "license_valid": true
+    },
+    "testing1": {
+        "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEgGWVVtn1XxEG5mxxepg/NaXvSkln\nXqr3lBxLLVr9MMY15ZuDgzxJAejhR3HgtyzSN6u7jtIGCiUAh5bo8aEVJg==\n-----END PUBLIC KEY-----\n",
+        "pin_salt": "22d704c99eed9f6a653ec5d20f455d7b",
+        "pin_hash": "21d56c78fd22e7adeaec4a59e28ccde8abc4759562e23fa51fce3fdb319a326c",
+        "license_valid": true
+    },
+    "testing2": {
+        "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEMzo4e0JD2TBaOzY9REI6wrd//Haj\nc8m+FpNoa4zjsOlCVw2WbMks283r4byl5GZ073ASJjA3RSvEES6Tnk7EEg==\n-----END PUBLIC KEY-----\n",
+        "pin_salt": "70b0d8992f0aecff9b0278befb438ac3",
+        "pin_hash": "91a55bb50b8c0c37aa9526aa232dda52e20a29fd5d24a4d7e156cc98f6a4e6a5",
+        "license_valid": true
     }
 }

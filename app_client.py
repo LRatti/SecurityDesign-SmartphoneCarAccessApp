@@ -18,7 +18,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 
 # -------------------------------------------------------------
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - AppClient - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - AppClient - %(levelname)s - %(message)s')
 
 # --- SSL Context Creation ---
 
@@ -780,6 +780,7 @@ def run_cli(client: AppClient):
         print("6. Unlock Car")
         print("7. Start Car")
         print("8. Lock Car")
+        print("9. Stop Car")
         print("0. Exit")
 
         choice = input("Enter your choice: ")
@@ -812,12 +813,19 @@ def run_cli(client: AppClient):
                  del_id = input("Enter Delegation ID to revoke: ")
                  if del_id:
                      client.revoke_delegation(del_id)
+            # --- Car Interaction Cases ---
             elif choice == '6':
-                client.request_car_action("UNLOCK_REQUEST")
+                # Ask for car ID if multiple cars are supported later
+                # car_id_to_unlock = input("Enter Car ID to unlock [default: configured car]: ") or None
+                client.request_car_action("UNLOCK_REQUEST") # Pass car_id_to_unlock if implemented
             elif choice == '7':
                 client.request_car_action("START_REQUEST")
             elif choice == '8':
                 client.request_car_action("LOCK_REQUEST")
+            # --- NEW CASE ---
+            elif choice == '9':
+                client.request_car_action("STOP_CAR_REQUEST")
+            # ----------------
             elif choice == '0':
                 print("Exiting.")
                 break
@@ -827,7 +835,7 @@ def run_cli(client: AppClient):
              print(f"\nAn error occurred: {e}")
              logging.exception("CLI Error")
 
-        time.sleep(0.1)
+        time.sleep(0.1) # Prevent tight loop on error
 
 # --- Main Execution Block ---
 if __name__ == "__main__":

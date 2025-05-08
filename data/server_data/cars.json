@@ -1,7 +1,7 @@
 {
     "CAR_VIN_DEMO_789": {
-        "owner_user_id": "besar",
-        "model": "ferrari",
+        "owner_user_id": "testing1",
+        "model": "mercedes",
         "certificate_fingerprint_sha256": "0491d364f0b2dc95c461df0ca72e7c956ae3868740eb8582406b91b680c894bf"
     }
 }

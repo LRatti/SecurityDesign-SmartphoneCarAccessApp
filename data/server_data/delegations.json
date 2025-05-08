@@ -10,5 +10,29 @@
         ],
         "expiry_timestamp": 1746186068.5972714,
         "status": "revoked"
+    },
+    "a1a75a06-154c-47f1-b192-fd1a3ea379ed": {
+        "delegation_id": "a1a75a06-154c-47f1-b192-fd1a3ea379ed",
+        "car_id": "CAR_VIN_DEMO_1",
+        "owner_user_id": "testing1",
+        "recipient_user_id": "testing2",
+        "permissions": [
+            "START",
+            "UNLOCK"
+        ],
+        "expiry_timestamp": 1746561260.2604249,
+        "status": "revoked"
+    },
+    "9267e529-d211-4dd2-9951-15c6e8e6d3e6": {
+        "delegation_id": "9267e529-d211-4dd2-9951-15c6e8e6d3e6",
+        "car_id": "CAR_VIN_DEMO_789",
+        "owner_user_id": "testing1",
+        "recipient_user_id": "testing2",
+        "permissions": [
+            "START",
+            "UNLOCK"
+        ],
+        "expiry_timestamp": 1746561465.930535,
+        "status": "active"
     }
 }
