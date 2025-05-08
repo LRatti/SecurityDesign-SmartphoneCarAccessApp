@@ -336,36 +336,25 @@ class BackendServer:
         
         # --- User Signup ---
         if msg_type == "SIGNUP":
-            
             if not is_provisioning_connection:
                 logging.warning(f"Rejecting SIGNUP from non-provisioning connection (CN: {client_cn})")
                 return {"type": "SIGNUP_NAK", "payload": {"error": "Signup only allowed during initial provisioning"}}
-            
             user_id = payload.get('user_id')
             pin = payload.get('pin')
             csr_pem_str = payload.get('csr_pem')
-        
             if not user_id or not pin or not csr_pem_str:
                 return {"type": "SIGNUP_NAK", "payload": {"error": "Missing user_id, pin, or csr_pem"}}
-
             if not isinstance(pin, str) or not pin.isdigit() or len(pin) != 4:
                  return {"type": "SIGNUP_NAK", "payload": {"error": "PIN must be a 4-digit number"}}
-
-            # --- Parse CSR ---
             try:
                 csr_pem = csr_pem_str.encode('utf-8')
                 csr = x509.load_pem_x509_csr(csr_pem, default_backend())
-
-                # --- Verify CSR Signature ---
                 if not csr.is_signature_valid:
                     logging.warning(f"CSR signature validation failed for user '{user_id}'.")
                     return {"type": "SIGNUP_NAK", "payload": {"error": "Invalid CSR signature"}}
-
-                # Extract Public Key and Subject CN from CSR
                 csr_public_key = csr.public_key()
                 csr_subject = csr.subject
                 try:
-                    # Ensure CN matches the user_id payload
                     csr_cn = csr_subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
                     if csr_cn != user_id:
                          logging.warning(f"CSR CN '{csr_cn}' does not match payload user_id '{user_id}'.")
@@ -373,7 +362,6 @@ class BackendServer:
                 except IndexError:
                      logging.warning(f"CSR for user '{user_id}' is missing Common Name.")
                      return {"type": "SIGNUP_NAK", "payload": {"error": "CSR missing common name"}}
-
             except Exception as e:
                 logging.error(f"Failed to parse CSR for user '{user_id}': {e}")
                 return {"type": "SIGNUP_NAK", "payload": {"error": "Invalid CSR format"}}
@@ -382,26 +370,15 @@ class BackendServer:
                 if user_id in self.users:
                     return {"type": "SIGNUP_NAK", "payload": {"error": "User ID already exists"}}
                 else:
-                    # --- Sign the Certificate ---
-                    if not CA_CERT or not CA_KEY: # Should have been checked at startup
+                    if not CA_CERT or not CA_KEY:
                          logging.critical("CA credentials not loaded, cannot sign certificate.")
                          return {"type": "SIGNUP_NAK", "payload": {"error": "Server internal error: CA unavailable"}}
                     try:
-                        builder = x509.CertificateBuilder()
-                        builder = builder.subject_name(csr_subject) # Use subject from CSR
-                        builder = builder.issuer_name(CA_CERT.subject) # Issuer is CA
-                        builder = builder.public_key(csr_public_key) # Public key from CSR
-                        builder = builder.serial_number(x509.random_serial_number()) # Unique serial
-                        builder = builder.not_valid_before(datetime.utcnow())
-                        builder = builder.not_valid_after(datetime.utcnow() + timedelta(days=365)) # 1 year validity
-
-                        # Add extensions from CSR if needed (e.g., Key Usage)
-                        # for ext in csr.extensions: builder = builder.add_extension(ext.value, critical=ext.critical)
-                        # Or add default extensions:
-                        builder = builder.add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
-                        builder = builder.add_extension(x509.KeyUsage(digital_signature=True, key_encipherment=False, data_encipherment=False, key_agreement=False, content_commitment=True, key_cert_sign=False, crl_sign=False, encipher_only=False, decipher_only=False), critical=True)
-
-
+                        builder = x509.CertificateBuilder().subject_name(csr_subject).issuer_name(CA_CERT.subject) \
+                            .public_key(csr_public_key).serial_number(x509.random_serial_number()) \
+                            .not_valid_before(datetime.utcnow()).not_valid_after(datetime.utcnow() + timedelta(days=365)) \
+                            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True) \
+                            .add_extension(x509.KeyUsage(digital_signature=True, key_encipherment=False, data_encipherment=False, key_agreement=False, content_commitment=True, key_cert_sign=False, crl_sign=False, encipher_only=False, decipher_only=False), critical=True)
                         new_certificate = builder.sign(CA_KEY, crypto_hashes.SHA256(), default_backend())
                         new_certificate_pem_str = new_certificate.public_bytes(serialization.Encoding.PEM).decode('utf-8')
                         logging.info(f"Successfully signed certificate for user '{user_id}'.")
@@ -412,35 +389,29 @@ class BackendServer:
                     except Exception as e:
                         logging.error(f"Failed to sign certificate for user '{user_id}': {e}")
                         return {"type": "SIGNUP_NAK", "payload": {"error": "Server internal error: Certificate signing failed"}}
-                    
-                    # --- Store User Data ---
                     salt = self._generate_salt()
                     pin_hash = self._hash_pin(pin, salt)
+                    
+                    # --- ADD LICENSE EXPIRY ---
+                    current_time = datetime.utcnow()
+                    # License expires in 1 year (configurable, e.g., from config.py)
+                    license_duration_days = 365 
+                    license_expiry_timestamp = (current_time + timedelta(days=license_duration_days)).timestamp()
+                    
                     self.users[user_id] = {
-                        'certificate_fingerprint_sha256': user_cert_fingerprint,  # Store user's certificate fingerprint
-                        'pin_salt': salt.hex(), # Store salt as hex string
+                        'certificate_fingerprint_sha256': user_cert_fingerprint,
+                        'pin_salt': salt.hex(),
                         'pin_hash': pin_hash,
-                        'license_valid': True # Default license to valid on signup
+                        'license_valid': True, # Initial general validity flag
+                        'license_expiry_timestamp': license_expiry_timestamp # Store expiry timestamp
                     }
-                    users_copy = self.users.copy() # Make copy inside lock
-
-            # Save outside lock
+                    users_copy = self.users.copy()
             self._save_json(config.REGISTRATION_FILE, users_copy, "user registrations")
-            logging.info(f"User '{user_id}' signed up successfully. Stored cert fingerprint.")
+            logging.info(f"User '{user_id}' signed up successfully. License expires on {datetime.fromtimestamp(license_expiry_timestamp).strftime('%Y-%m-%d')}.")
             response.update({
                 "type": "SIGNUP_ACK",
                 "payload": {"status": "OK", "user_id": user_id, "certificate_pem": new_certificate_pem_str}
             })
-
-            # --- Send ACK with Certificate ---
-            # response.update({
-            #     "type": "SIGNUP_ACK",
-            #     "payload": {
-            #         "status": "OK",
-            #         "user_id": user_id,
-            #         "certificate_pem": new_certificate_pem.decode('utf-8') # Send back the signed cert
-            #     }
-            # })
 
         # --- User Login ---
         elif msg_type == "LOGIN":
@@ -495,21 +466,34 @@ class BackendServer:
                 response.update({"type": "LOGIN_NAK", "payload": {"error": "Invalid user ID or PIN"}})
         
         elif msg_type == "CHECK_LICENSE":
-                # TODO (AUTH): Verify signature from 'sender_id' on the payload/message content.
-                # signature = message.get('signature')
-                # data_signed = json.dumps(payload) # Or however the app signs it
-                # if not verify_user_signature(sender_id, data_signed, signature):
-                #     return {"type": "ERROR", "payload": {"error": "Invalid signature"}}
-                sender_id = message.get('sender_id') # Get sender_id from message now
-                if not sender_id: return {"type": "ERROR", "payload": {"error": "Missing sender_id for CHECK_LICENSE"}}
-                with self.user_lock:
-                    user_data = self.users.get(sender_id)
-                if user_data:
-                    is_valid = user_data.get('license_valid', False)
-                    response.update({"type": "LICENSE_STATUS", "payload": {"user_id": sender_id, "is_valid": is_valid}})
-                else:
-                    response.update({"type": "LICENSE_STATUS", "payload": {"error": "User not registered", "user_id": sender_id, "is_valid": False}})
+            sender_id = message.get('sender_id')
+            if not sender_id: return {"type": "ERROR", "payload": {"error": "Missing sender_id for CHECK_LICENSE"}}
+            with self.user_lock:
+                user_data = self.users.get(sender_id)
+            if user_data:
+                current_time_ts = datetime.utcnow().timestamp()
+                expiry_ts = user_data.get('license_expiry_timestamp')
+                is_expired = expiry_ts is None or current_time_ts > expiry_ts
+                
+                # Overall validity considering both the 'license_valid' flag and expiry
+                other_validity_flag = user_data.get('license_valid', True) # E.g., manual revocation
+                overall_license_valid = other_validity_flag and not is_expired
 
+                response.update({
+                    "type": "LICENSE_STATUS",
+                    "payload": {
+                        "user_id": sender_id,
+                        "is_valid": overall_license_valid,
+                        "is_expired": is_expired,
+                        "expiry_timestamp": expiry_ts,
+                        "manually_revoked": not other_validity_flag # More descriptive
+                    }
+                })
+            else:
+                response.update({
+                    "type": "LICENSE_STATUS",
+                    "payload": {"error": "User not registered", "user_id": sender_id, "is_valid": False, "is_expired": True, "expiry_timestamp": None}
+                })
 
 
         # --- Delegation Management ---
@@ -851,93 +835,90 @@ class BackendServer:
 
             # --- Access Validation (Called by Car Server) ---
             elif msg_type == "VALIDATE_ACCESS_ATTEMPT":
-                # TODO (AUTH): Verify that this request genuinely came from the car identified by 'sender_id'.
-                #   This requires the car to have a registered key and sign this request.
-                # car_signature = message.get('car_signature')
-                # car_data_signed = json.dumps(payload)
-                # if not verify_car_signature(sender_id, car_data_signed, car_signature): # Need verify_car_signature helper
-                #    return {"type": "ACCESS_DENIED", "payload": {"error": "Invalid car signature on validation request"}}
-
-                # sender_id here is the car_id making the request
                 requesting_user_id = payload.get('requesting_user_id')
-                car_id = payload.get('car_id') # Car should know its own ID, but client sends it for verification
-                requested_action = payload.get('requested_action') # e.g., "UNLOCK", "START"
+                car_id = payload.get('car_id')
+                requested_action = payload.get('requested_action')
                 car_id_sender = message.get('sender_id') # Car sending the request
-
                 if not car_id_sender: return {"type": "ERROR", "payload": {"error": "Missing sender_id (car) for VALIDATE_ACCESS_ATTEMPT"}}
-
                 if not requesting_user_id or not car_id or not requested_action:
                     response.update({"type": "ACCESS_DENIED", "payload": {"error": "Incomplete validation request"}})
                 else:
-                    # 1. Check Ownership
-                    with self.car_lock:
-                        car_info = self.cars.get(car_id)
-                    is_owner = car_info and car_info['owner_user_id'] == requesting_user_id
+                    # --- Step 1: Check License Validity and Expiry ---
+                    with self.user_lock: user_info = self.users.get(requesting_user_id)
+                    
+                    license_ok_for_action = False
+                    if user_info:
+                        current_time_ts = datetime.utcnow().timestamp()
+                        expiry_ts = user_info.get('license_expiry_timestamp')
+                        manually_revoked = not user_info.get('license_valid', True)
+                        
+                        is_expired_now = expiry_ts is None or current_time_ts > expiry_ts
+                        
+                        if manually_revoked or is_expired_now:
+                            if requested_action in [config.PERMISSION_UNLOCK, config.PERMISSION_START]:
+                                logging.warning(f"Access DENIED for user '{requesting_user_id}' on car '{car_id}' for action '{requested_action}'. Reason: License {'manually revoked' if manually_revoked else 'expired'}.")
+                                response.update({"type": "ACCESS_DENIED", "payload": {"error": f"User license {'manually revoked' if manually_revoked else 'expired'}", "reason": "LicenseInvalidOrExpired"}})
+                                return response # Exit early
+                            # For other actions (like LOCK, STOP_CAR), license expiry might not block them.
+                            # This part of the logic can be adjusted based on exact requirements for non-critical actions.
+                            else:
+                                license_ok_for_action = True # Allow non-critical actions even if license has issues
+                        else:
+                            license_ok_for_action = True # License is valid and not expired
+                    else: # User not found
+                        if requested_action in [config.PERMISSION_UNLOCK, config.PERMISSION_START]:
+                            logging.warning(f"Access DENIED for unknown user '{requesting_user_id}' for action '{requested_action}'.")
+                            response.update({"type": "ACCESS_DENIED", "payload": {"error": "User not registered", "reason": "UserNotFound"}})
+                            return response
+                    
+                    # If license is not OK for UNLOCK/START, we would have returned.
+                    # Proceed to check ownership or delegation.
 
-                    # 2. Check License (Crucial for START action, maybe optional for UNLOCK)
-                    with self.user_lock:
-                        user_info = self.users.get(requesting_user_id)
-                    license_valid = user_info and user_info.get('license_valid', False)
-
+                    with self.car_lock: car_info_val = self.cars.get(car_id) # Renamed to avoid conflict
+                    is_owner = car_info_val and car_info_val['owner_user_id'] == requesting_user_id
                     access_granted = False
                     permissions_granted = []
                     grant_reason = "Unknown"
 
                     if is_owner:
-                            # Owner access
-                            grant_reason = "Owner"
-                            if requested_action == config.PERMISSION_START and not license_valid:
-                                access_granted = False
-                                response.update({"type": "ACCESS_DENIED", "payload": {"error": "Owner license invalid/revoked", "reason": grant_reason}})
-                            else:
-                                access_granted = True
-                                permissions_granted = [config.PERMISSION_UNLOCK, config.PERMISSION_START] # Owner gets all perms
-                                # Check if the requested action is implicitly allowed for owner
-                                if requested_action in permissions_granted:
-                                    response.update({"type": "ACCESS_GRANTED", "payload": {"status": "OK", "reason": grant_reason, "granted_permissions": permissions_granted}})
-                                else:
-                                    # Should not happen if request action is valid
-                                    access_granted = False
-                                    response.update({"type": "ACCESS_DENIED", "payload": {"error": f"Action '{requested_action}' not applicable", "reason": grant_reason}})
-
-                    else:
-                        # 3. Check Delegations if not owner
+                        grant_reason = "Owner"
+                        # License already checked if action is UNLOCK/START
+                        access_granted = True
+                        permissions_granted = [config.PERMISSION_UNLOCK, config.PERMISSION_START]
+                        if requested_action in permissions_granted:
+                            response.update({"type": "ACCESS_GRANTED", "payload": {"status": "OK", "reason": grant_reason, "granted_permissions": permissions_granted}})
+                        else:
+                            access_granted = False
+                            response.update({"type": "ACCESS_DENIED", "payload": {"error": f"Action '{requested_action}' not applicable for owner", "reason": grant_reason}})
+                    else: # Check Delegations
                         grant_reason = "Delegation"
                         found_valid_delegation = False
                         with self.delegation_lock:
-                            # Iterate through copies to avoid issues if modifying during iteration (though we only read here)
                             active_delegations = [d for d in self.delegations.values() if
                                                     d['car_id'] == car_id and
                                                     d['recipient_user_id'] == requesting_user_id and
                                                     d['status'] == 'active' and
                                                     time.time() < d['expiry_timestamp']]
-
                         if active_delegations:
-                            # In theory, there should only be one active for a user/car, but check all valid ones
                             for delegation in active_delegations:
                                 if requested_action in delegation.get('permissions', []):
-                                        # Now check license for START permission via delegation
-                                        if requested_action == config.PERMISSION_START and not license_valid:
-                                            response.update({"type": "ACCESS_DENIED", "payload": {"error": "Delegated user license invalid/revoked", "reason": grant_reason, "delegation_id": delegation['delegation_id']}})
-                                            found_valid_delegation = False # Mark as invalid attempt overall
-                                            break # Stop checking other delegations for this user/car
-                                        else:
-                                            # Valid delegation found for the action & license OK if starting
-                                            permissions_granted = delegation['permissions']
-                                            response.update({"type": "ACCESS_GRANTED", "payload": {"status": "OK", "reason": grant_reason, "delegation_id": delegation['delegation_id'], "granted_permissions": permissions_granted}})
-                                            found_valid_delegation = True
-                                            break # Found a working delegation
-
-                        if not found_valid_delegation and "error" not in response.get("payload", {}): # Don't overwrite license error
+                                    # License already checked if action is UNLOCK/START
+                                    permissions_granted = delegation['permissions']
+                                    response.update({"type": "ACCESS_GRANTED", "payload": {"status": "OK", "reason": grant_reason, "delegation_id": delegation['delegation_id'], "granted_permissions": permissions_granted}})
+                                    found_valid_delegation = True
+                                    break
+                        if not found_valid_delegation and "error" not in response.get("payload", {}):
                             response.update({"type": "ACCESS_DENIED", "payload": {"error": f"No active/valid delegation found for user '{requesting_user_id}' on car '{car_id}' with permission for '{requested_action}'", "reason": grant_reason}})
-                            access_granted = False # Explicitly set
+                            access_granted = False
                         elif found_valid_delegation:
                             access_granted = True
-
+                    
                     if access_granted:
                         logging.info(f"Access GRANTED for user '{requesting_user_id}' on car '{car_id}' for action '{requested_action}'. Reason: {grant_reason}.")
-                    else:
-                        logging.warning(f"Access DENIED for user '{requesting_user_id}' on car '{car_id}' for action '{requested_action}'. Reason: {response.get('payload',{}).get('error', 'Denied')}.")
+                    elif "error" not in response.get("payload", {}): # If no specific error already set (like delegation not found)
+                            # This case might be redundant if all paths set an error or grant access
+                            logging.warning(f"Access DENIED for user '{requesting_user_id}' on car '{car_id}' for action '{requested_action}'. Default denial.")
+                            response.update({"type": "ACCESS_DENIED", "payload": {"error": "Access denied", "reason": "DefaultDenial"}})
 
 
 
