@@ -775,12 +775,11 @@ def run_cli(client: AppClient):
         print("2. Register a New Car")
         print("3. Delegate Access to Car")
         print("4. Revoke Last Delegation")
-        print("5. Revoke Specific Delegation")
         print("--- Car Interaction ---")
-        print("6. Unlock Car")
-        print("7. Start Car")
-        print("8. Lock Car")
-        print("9. Stop Car")
+        print("5. Unlock Car")
+        print("6. Start Car")
+        print("7. Lock Car")
+        print("8. Stop Car")
         print("0. Exit")
 
         choice = input("Enter your choice: ")
@@ -801,7 +800,10 @@ def run_cli(client: AppClient):
                 duration_h = float(duration_h_str) if duration_h_str else 1.0
                 permissions = [p.strip().upper() for p in perms_str.split(',') if p.strip()]
                 if car_id and recipient and permissions:
-                    client.delegate_access(car_id, recipient, permissions, duration_h)
+                    if len(permissions) == 1 and permissions[0] == "START":
+                        print("Cannot delegate only 'START' persmission!")
+                    else:
+                        client.delegate_access(car_id, recipient, permissions, duration_h)
                 else:
                     print("Missing required info for delegation.")
             elif choice == '4':
@@ -809,21 +811,17 @@ def run_cli(client: AppClient):
                     client.revoke_delegation(client.last_delegation_id)
                  else:
                     print("No delegation ID stored from the last 'delegate' action.")
-            elif choice == '5':
-                 del_id = input("Enter Delegation ID to revoke: ")
-                 if del_id:
-                     client.revoke_delegation(del_id)
             # --- Car Interaction Cases ---
-            elif choice == '6':
+            elif choice == '5':
                 # Ask for car ID if multiple cars are supported later
                 # car_id_to_unlock = input("Enter Car ID to unlock [default: configured car]: ") or None
                 client.request_car_action("UNLOCK_REQUEST") # Pass car_id_to_unlock if implemented
-            elif choice == '7':
+            elif choice == '6':
                 client.request_car_action("START_REQUEST")
-            elif choice == '8':
+            elif choice == '7':
                 client.request_car_action("LOCK_REQUEST")
             # --- NEW CASE ---
-            elif choice == '9':
+            elif choice == '8':
                 client.request_car_action("STOP_CAR_REQUEST")
             # ----------------
             elif choice == '0':

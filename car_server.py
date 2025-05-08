@@ -47,18 +47,15 @@ class CarServer:
             self._log(logging.INFO, f"Loading CAR cert chain: {config.CAR_CERT_FILE}, {config.CAR_KEY_FILE}")
             context.load_cert_chain(certfile=config.CAR_CERT_FILE, keyfile=config.CAR_KEY_FILE)
 
-            self._log(logging.INFO, f"Loading CA cert for client verification: {config.CA_CERT_FILE}")
-            # Require client certificate and verify it against our CA
-            # Verify AppClient's cert using CA
-            context.load_verify_locations(cafile=config.CA_CERT_FILE)
+            self._log(logging.INFO, f"Loading CA chain for client verification: {config.CA_CHAIN_FILE}") # Use CA_CHAIN_FILE
+            context.load_verify_locations(cafile=config.CA_CHAIN_FILE) # Use CA_CHAIN_FILE
             context.verify_mode = ssl.CERT_REQUIRED
-            self._log(logging.INFO, "INCOMING SSL context created successfully for mTLS (Car <- App).")
 
             # Optional: Set specific TLS versions or cipher suites
             context.minimum_version = ssl.TLSVersion.TLSv1_3
             context.set_ciphers('ECDHE+AESGCM:!aNULL') # Example
 
-            self._log(logging.INFO, "SSL context created successfully for mTLS.")
+            self._log(logging.INFO, "INCOMING SSL context created successfully for mTLS (Car <- App).")
             return context
         except ssl.SSLError as e:
             self._log(logging.CRITICAL, f"SSL Error creating server context: {e}")
@@ -79,9 +76,9 @@ class CarServer:
             # Uses CAR's cert/key TO authenticate itself TO BackendServer
             context.load_cert_chain(certfile=config.CAR_CERT_FILE, keyfile=config.CAR_KEY_FILE)
 
-            self._log(logging.INFO, f"Loading CA cert for backend server verification: {config.CA_CERT_FILE}")
+            self._log(logging.INFO, f"Loading CA chain for backend server verification: {config.CA_CHAIN_FILE}") # Use CA_CHAIN_FILE
             # Uses CA cert TO verify the BackendServer's certificate
-            context.load_verify_locations(cafile=config.CA_CERT_FILE)
+            context.load_verify_locations(cafile=config.CA_CHAIN_FILE) # Use CA_CHAIN_FILE
             context.verify_mode = ssl.CERT_REQUIRED
 
             # Hostname checking for the backend server - IMPORTANT
@@ -202,19 +199,19 @@ class CarServer:
         return access_granted
 
     # --- Helper Method: Validate App Public Key with Backend ---
-    def _validate_app_pubkey_with_server(self, app_public_key_pem: str, user_id: str) -> bool:
+    def _validate_app_pubkey_with_server(self, app_certificate_pem_str: str, user_id: str) -> bool:
         """Contacts the backend server securely (TLS) to validate the app's public key PEM for the given user."""
-        if not app_public_key_pem or not user_id:
-            self._log(logging.ERROR, "App public key PEM or User ID missing for validation call.")
+        if not app_certificate_pem_str or not user_id: # MODIFIED check
+            self._log(logging.ERROR, "App certificate PEM or User ID missing for validation call.")
             return False
 
-        self._log(logging.INFO, f"Validating app public key for user '{user_id}' with backend.")
+        self._log(logging.INFO, f"Validating app certificate for user '{user_id}' with backend.")
         validation_message = {
-            "type": "VALIDATE_APP_PUBKEY", # New message type
+            "type": "VALIDATE_APP_PUBKEY", # Type name kept, payload key changed
             "sender_id": self.car_id,
             "payload": {
                 "user_id_to_validate": user_id,
-                "app_public_key_pem": app_public_key_pem
+                "app_certificate_pem": app_certificate_pem_str # MODIFIED payload key
             }
         }
 
@@ -229,7 +226,7 @@ class CarServer:
                 backend_tls_sock.settimeout(5.0)
                 response = network_utils.receive_message(backend_tls_sock)
                 if response and response.get("type") == "VALIDATE_APP_PUBKEY_ACK" and response.get("payload", {}).get("status") == "VALID":
-                    self._log(logging.INFO, f"Backend validation SUCCESS for app public key (User: {user_id}).")
+                    self._log(logging.INFO, f"Backend validation SUCCESS for app certificate (User: {user_id}).")
                     return True
                 else:
                     reason = response.get("payload", {}).get("reason", "Unknown") if response else "No response"
@@ -252,39 +249,38 @@ class CarServer:
                  try: backend_tls_sock.shutdown(socket.SHUT_RDWR)
                  except OSError: pass
                  backend_tls_sock.close()
+        return False # Default to false if any error path not returning explicitly
 
 
     def handle_client(self, ssl_client_socket: ssl.SSLSocket, address): # <-- Takes SSLSocket now
         threading.current_thread().name = f"App-{address[0]}:{address[1]}"
         self._log(logging.INFO, f"TLS connection established with {address}")
 
-        app_public_key_pem = None # Store PEM string now
+        # Extract full app certificate PEM
+        app_certificate_pem_str = None
 
         try:
-            # Get app certificate in DER format
             app_cert_der = ssl_client_socket.getpeercert(binary_form=True)
             if not app_cert_der:
                  raise ValueError("Could not get peer certificate (app) in binary form.")
+            
+            app_cert_obj = x509.load_der_x509_certificate(app_cert_der, default_backend())
+            # Serialize the *entire certificate* to PEM
+            app_certificate_pem_str = app_cert_obj.public_bytes(
+                 encoding=serialization.Encoding.PEM
+            ).decode('utf-8')
+            self._log(logging.INFO, f"App's full certificate PEM extracted for validation.")
 
-            # Parse DER cert, extract public key, serialize to PEM
-            app_cert = x509.load_der_x509_certificate(app_cert_der, default_backend())
-            public_key = app_cert.public_key()
-            app_public_key_pem = public_key.public_bytes(
-                 encoding=serialization.Encoding.PEM,
-                 format=serialization.PublicFormat.SubjectPublicKeyInfo
-            ).decode('utf-8') # Decode to string
-
-            self._log(logging.INFO, f"App public key PEM extracted:\n{app_public_key_pem[:80]}...")
-        except (ValueError, TypeError, ssl.SSLError) as e: # Catch parsing/serialization errors
-             self._log(logging.ERROR, f"Failed to get or process app certificate/key from {address}: {e}. Closing connection.")
+        except (ValueError, TypeError, ssl.SSLError) as e:
+             self._log(logging.ERROR, f"Failed to get or process app certificate from {address}: {e}. Closing connection.")
              try: ssl_client_socket.close()
              except Exception: pass
-             return # Abort handling
-        except Exception as e: # Catch other unexpected errors
-            self._log(logging.ERROR, f"Unexpected error getting app pubkey from {address}: {e}. Closing connection.")
+             return
+        except Exception as e:
+            self._log(logging.ERROR, f"Unexpected error getting app certificate from {address}: {e}. Closing connection.")
             try: ssl_client_socket.close()
             except Exception: pass
-            return # Abort handling
+            return
 
         # --- Log Client Cert Info (Optional Debugging) ---
         try:
@@ -308,8 +304,8 @@ class CarServer:
                 if message is None:
                     break
 
-                # --- Pass message AND public key PEM to process_message ---
-                response = self.process_message(message, app_public_key_pem, ssl_client_socket)
+                # Pass full app_certificate_pem_str
+                response = self.process_message(message, app_certificate_pem_str, ssl_client_socket)
                 
                 if response:
                     # Send response over the SSL socket
@@ -330,11 +326,12 @@ class CarServer:
                 pass # Ignore if already closed
             ssl_client_socket.close()
 
-    def process_message(self, message: dict, app_public_key_pem: str, ssl_sock: ssl.SSLSocket) -> dict | None:        
+    def process_message(self, message: dict, app_certificate_pem_str: str, ssl_sock: ssl.SSLSocket) -> dict | None:        
         msg_type = message.get('type')
         # This is the user interacting with the car via the app
         requesting_user_id = message.get('sender_id')        
         payload = message.get('payload', {}) # Use if needed
+        response = {"sender_id": self.car_id} # Initialize response
         # TODO (AUTH): Extract signature/auth_data from payload.
         #   auth_data = payload.get('auth_data') # Could be signature or signed nonce
 
@@ -345,12 +342,12 @@ class CarServer:
         self._log(logging.INFO, f"Processing message type '{msg_type}' from user '{requesting_user_id}'")
 
         # ---=== Step 1: Validate App Public Key against User ID ===---
-        if not self._validate_app_pubkey_with_server(app_public_key_pem, requesting_user_id): # Call new validator
-             # Validation failed! Logged in helper function.
-             self._log(logging.WARNING, f"Authentication failed for user '{requesting_user_id}' due to app public key mismatch.")
+        # Validate app's full certificate PEM
+        if not self._validate_app_pubkey_with_server(app_certificate_pem_str, requesting_user_id):
+             self._log(logging.WARNING, f"Authentication failed for user '{requesting_user_id}' due to app certificate mismatch.")
              nak_type = "ERROR"
              if msg_type.endswith("_REQUEST"): nak_type = msg_type.replace("_REQUEST", "_NAK")
-             return {"type": nak_type, "sender_id": self.car_id, "payload": {"error": "Authentication failed"}}
+             return {"type": nak_type, "sender_id": self.car_id, "payload": {"error": "Authentication failed (certificate validation)"}} # More specific error
         # ---=== Validation Successful ===---
 
 
@@ -512,5 +509,8 @@ class CarServer:
 if __name__ == "__main__":
     # Should get this from config/secure storage in a real car
     car_id = os.environ.get("CAR_ID", "CAR_VIN_DEMO_789")
+    # Corrected CA file in car_server.py based on general structure
+    # Ensuring car_server uses CA_CHAIN_FILE for verifying app client certs and backend server certs
+    # This was done in _create_incoming_ssl_context and _create_outgoing_ssl_context
     car = CarServer(car_id, config.CAR_IP, config.CAR_PORT)
     car.start()
