@@ -22,6 +22,7 @@ os.makedirs(SERVER_DATA_DIR, exist_ok=True)
 PERMISSION_UNLOCK = "UNLOCK"
 PERMISSION_START = "START"
 VALID_PERMISSIONS = {PERMISSION_UNLOCK, PERMISSION_START}
+APP_CLIENT_CHECK_HOSTNAME = True # Or False, depending on your cert CNs
 
 # --- TLS Configuration ---
 # Directory where certificates are stored
@@ -71,3 +72,5 @@ CA_CHAIN_FILE = os.path.join(CERT_DIR, 'ca-chain.pem')
 # Check if files exist (optional, but good for debugging setup)
 if not os.path.exists(CA_CERT_FILE):
     print(f"Warning: CA Certificate not found at {CA_CERT_FILE}")
+
+TIMESTAMP_WINDOW_SECONDS = 3 # Adjust as needed (e.g., 5-15 seconds)

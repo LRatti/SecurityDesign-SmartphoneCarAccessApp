@@ -18,5 +18,11 @@
         "pin_salt": "70b0d8992f0aecff9b0278befb438ac3",
         "pin_hash": "91a55bb50b8c0c37aa9526aa232dda52e20a29fd5d24a4d7e156cc98f6a4e6a5",
         "license_valid": true
+    },
+    "besar1": {
+        "certificate_fingerprint_sha256": "f3017019fbda91491041a856bbf85db4110d39072aceeecfe73cd85379ce6585",
+        "pin_salt": "7ba45ff2b259b7d2598d3c8bf760ab7b",
+        "pin_hash": "abffb410dd6779349d755530fb09265acb642d35c8169b73699be39faa59bbf7",
+        "license_valid": true
     }
 }
