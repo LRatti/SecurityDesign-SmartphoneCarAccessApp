@@ -599,31 +599,48 @@ class AppClient:
         return response
 
     def check_license_status(self):
-        """Checks the user's driving license status with the server."""
         logging.info("Checking license status with the backend server...")
-        message = {
-            "type": "CHECK_LICENSE",
-            "sender_id": self.user_id,
-            "payload": {}
-            # TODO (AUTH): Add signature to authenticate the request.
-
-        }
-        response = self._send_and_receive(self.server_addr, message) # No target_car_id
+        message = {"type": "CHECK_LICENSE", "sender_id": self.user_id, "payload": {}}
+        response = self._send_and_receive(self.server_addr, message)
         if response and response.get("type") == "LICENSE_STATUS":
             payload = response.get("payload", {})
             if "error" in payload:
-                 logging.error(f"License check failed: {payload['error']}")
-                 return None
-            is_valid = payload.get("is_valid")
-            if is_valid is not None:
-                status = "Valid" if is_valid else "Invalid/Revoked"
-                logging.info(f"License status: {status}")
-                return is_valid
-            else:
-                 logging.error(f"Received malformed license status response.")
-                 return None
+                logging.error(f"License check failed: {payload['error']}")
+                return None
+
+            is_valid_overall = payload.get("is_valid") # This now reflects overall validity
+            is_expired_flag = payload.get("is_expired")
+            manually_revoked_flag = payload.get("manually_revoked")
+            expiry_ts = payload.get("expiry_timestamp")
+
+            status_str = "Unknown"
+            if is_valid_overall:
+                status_str = "Valid"
+            elif is_expired_flag:
+                status_str = "Expired"
+            elif manually_revoked_flag:
+                status_str = "Revoked (Manual)"
+            else: # General invalid if none of the above but is_valid_overall is false
+                status_str = "Invalid"
+
+
+            expiry_date_str = "N/A"
+            if expiry_ts:
+                try:
+                    expiry_datetime = datetime.fromtimestamp(expiry_ts) # Assumes UTC if no tzinfo
+                    expiry_date_str = expiry_datetime.strftime('%Y-%m-%d %H:%M:%S UTC')
+                except TypeError: # If expiry_ts is None
+                     expiry_date_str = "Not Set"
+                except Exception:
+                    expiry_date_str = "Invalid Date Format"
+            
+            logging.info(f"License Status: {status_str}")
+            if expiry_ts is not None : logging.info(f"License Expiry Date: {expiry_date_str}")
+            if manually_revoked_flag: logging.info("License has been manually revoked.")
+            
+            return is_valid_overall # Return the overall validity from server
         else:
-            logging.error(f"Failed to check license status.")
+            logging.error(f"Failed to check license status or malformed response.")
             return None
 
     # --- Car Management Functions ---
