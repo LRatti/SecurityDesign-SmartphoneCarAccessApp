@@ -1,4 +1,5 @@
 # app/app_client.py
+import argparse
 import socket
 import logging
 import ssl # <-- Import ssl
@@ -7,7 +8,7 @@ import time
 import json # For pretty printing responses
 import os
 import getpass # <-- Add getpass for hidden PIN input
-from utils import config, network_utils
+from utils import config, network_utils, crypto
 from datetime import datetime, timedelta # For cert validity
 # --- Cryptography for parsing cert and serializing key ---
 from cryptography import x509
@@ -21,6 +22,27 @@ from cryptography.hazmat.primitives.asymmetric import ec
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - AppClient - %(levelname)s - %(message)s')
 
 # --- SSL Context Creation ---
+MITM_PROXY_IP = '127.0.0.1'
+MITM_PROXY_PORT = 65005 # Port your mitm_proxy.py listens on
+
+def load_user_private_key(user_id: str, pin: str | None = None) -> ec.EllipticCurvePrivateKey | None:
+    """Loads the user's private key from their key file."""
+    # For POC, we'll assume key is not encrypted with PIN for simplicity.
+    # In real app, PIN would decrypt the key file or unlock access to secure storage.
+    user_key_path = config.get_user_key_path(user_id)
+    try:
+        with open(user_key_path, "r") as f: # Read as text for PEM
+            key_pem = f.read()
+        # If key was encrypted with a password (e.g., derived from PIN), pass it here:
+        # private_key = crypto.deserialize_private_key_pem(key_pem, password=pin.encode() if pin else None)
+        private_key = crypto.deserialize_private_key_pem(key_pem, password=None) # No password for POC key file
+        logging.info(f"Successfully loaded private key for user '{user_id}'.")
+        return private_key
+    except FileNotFoundError:
+        logging.error(f"Private key file not found for user '{user_id}' at {user_key_path}.")
+    except Exception as e:
+        logging.error(f"Failed to load/deserialize private key for user '{user_id}': {e}")
+    return None
 
 def create_provisioning_ssl_context():
     """Creates SSL context using the generic provisioning cert/key."""
@@ -33,7 +55,7 @@ def create_provisioning_ssl_context():
         # context.load_verify_locations(cafile=config.CA_CERT_FILE)
         context.load_verify_locations(cafile=config.CA_CHAIN_FILE)
         context.verify_mode = ssl.CERT_REQUIRED
-        context.check_hostname = False # As before
+        context.check_hostname = False
         if not context.check_hostname:
             logging.warning("SSL Hostname Check is DISABLED for Backend connection.")
         logging.debug("PROVISIONING SSL context created successfully for mTLS.")
@@ -241,15 +263,18 @@ def login_with_server(user_id: str, pin: str) -> bool:
         return False
 
 class AppClient:
-    def __init__(self, user_id):
+    def __init__(self, user_id, mitm_test_mode=False): # <--- Add mitm_test_mode argument
         self.user_id = user_id
         self.server_addr = (config.SERVER_IP, config.SERVER_PORT)
-        self.car_addr = (config.CAR_IP, config.CAR_PORT) # Assuming only one car for now
-        # TODO (AUTH): Load/generate user's private key securely (e.g., from file/keystore).
-        #   The public_key below should be derived from the actual private key.
+        self.car_sequence_number = 0
+        self.private_key = load_user_private_key(self.user_id) # PIN not used for decryption in this POC
 
-        # Public key is implicitly handled by TLS certs, no need to store here unless for signing
-        # self.public_key = f"pubkey_for_{self.user_id}" # Placeholder! Replace
+        if mitm_test_mode:
+            self.car_addr = (MITM_PROXY_IP, MITM_PROXY_PORT)
+            logging.warning(f"AppClient started in MitM TEST MODE. Connecting to CAR via proxy: {self.car_addr}")
+        else:
+            self.car_addr = (config.CAR_IP, config.CAR_PORT)
+            logging.info(f"AppClient started in NORMAL MODE. Connecting to CAR directly: {self.car_addr}")
 
         self.last_delegation_id = None # Store last created delegation ID for easy revocation
         
@@ -720,45 +745,67 @@ class AppClient:
              return False
 
 
+    def _get_next_car_sequence_number(self):
+        """Increments and returns the sequence number for car commands."""
+        self.car_sequence_number += 1
+        return self.car_sequence_number
 
     # --- Car Interaction ---
-    def request_car_action(self, action_type: str, target_car_addr=None, target_car_id: str | None = None): 
-        """Sends an action request (e.g., UNLOCK_REQUEST, START_REQUEST) to the car."""
-        # Uses the default car address unless overridden
-        # TODO (AUTH / UI): In a real app, biometric/PIN verification might be required here
-        #   before allowing the private key to be used for signing the request.
-
+    def request_car_action(self, action_type: str,
+                           payload_override: dict | None = None, # If None, generate new; else, use this
+                           target_car_addr=None,
+                           target_car_id: str | None = None):
+        """
+        Sends an action request to the car.
+        If payload_override is provided, it sends that exact payload (for replays).
+        Otherwise, it constructs a new payload with fresh timestamp, sequence, and signature.
+        """
         car_addr_to_use = target_car_addr if target_car_addr else self.car_addr
-
-        # --- Get the default car ID if not specified ---
-        # This is a simplification; a real app would know which car it's interacting with.
         if not target_car_id:
-            # You might need a way to configure the default car ID for the client
-            target_car_id = os.environ.get("CAR_ID", "CAR_VIN_DEMO_789") # Match car default
-            logging.warning(f"Target car ID not specified, using default: {target_car_id}")
+            target_car_id = os.environ.get("CAR_ID", "CAR_VIN_DEMO_789")
 
-        logging.info(f"Attempting to send '{action_type}' request to car at {car_addr_to_use}...")
+        logging.info(f"Attempting to send '{action_type}' request to car '{target_car_id}' at {car_addr_to_use}...")
 
+        current_payload_for_message: dict
+        is_replay_attempt = payload_override is not None
 
-        # TODO (AUTH): Implement challenge-response for car actions if required.
-        # Authentication payload (signatures etc.) is still missing here.
-        # The car now relies on server validation based on sender_id.
-        #   1. App sends initial request (e.g., "INITIATE_UNLOCK").
-        #   2. Car responds with a nonce (challenge).
-        #   3. App signs the nonce and sends it back in the actual action request (e.g., "UNLOCK_REQUEST").
-        #   If not using challenge-response, sign the payload directly here.
+        if is_replay_attempt:
+            current_payload_for_message = payload_override
+            logging.warning(f"SENDING PREPARED (REPLAY) PAYLOAD: {current_payload_for_message}")
+        else: # Normal legitimate request
+            if not self.private_key:
+                logging.error("Cannot sign car action: User private key not loaded.")
+                return False
+
+            current_timestamp = int(time.time())
+            sequence_no = self._get_next_car_sequence_number()
+            data_to_sign_dict = {
+                "action": action_type, "user_id": self.user_id, "car_id": target_car_id,
+                "timestamp": current_timestamp, "sequence_number": sequence_no
+            }
+            data_to_sign_bytes = json.dumps(data_to_sign_dict, sort_keys=True, separators=(',', ':')).encode('utf-8')
+            try:
+                signature_bytes = crypto.sign_message(self.private_key, data_to_sign_bytes)
+                signature_hex = signature_bytes.hex()
+            except Exception as e:
+                logging.error(f"Failed to sign car action data: {e}"); return False
+
+            current_payload_for_message = {
+                "timestamp": current_timestamp, "sequence_number": sequence_no,
+                "auth_data": {"signature": signature_hex}
+            }
+            logging.debug(f"Constructed signed payload: Timestamp={current_timestamp}, SeqNo={sequence_no}")
 
         message = {
             "type": action_type,
             "sender_id": self.user_id,
-            "payload": {
-                # Placeholder - actual signature or signed challenge goes here
-                "auth_data": "placeholder_for_crypto_team"
-                # TODO (AUTH): Replace placeholder with actual signature / signed nonce.
-            }
+            "payload": current_payload_for_message
         }
 
-        # Pass the target_car_id to _send_and_receive
+        if not is_replay_attempt: # Only capture legitimate, new messages
+            AppClient.last_sent_car_message_for_replay = message.copy()
+            logging.info(f"Message captured for potential replay test: {AppClient.last_sent_car_message_for_replay['type']}")
+
         response = self._send_and_receive(car_addr_to_use, message, target_car_id=target_car_id)
 
         if response:
@@ -785,8 +832,6 @@ def run_cli(client: AppClient):
     """Runs the main menu *after* the user has logged in."""
     while True:
         print(f"\n--- Smartphone Car Access App (User: {client.user_id}) ---")
-        # print("--- User/Server ---") # Registration/Login now handled outside
-        # print("1. Register User with Server") # Removed
         print("1. Check License Status")
         print("--- Car Management (Owner) ---")
         print("2. Register a New Car")
@@ -797,6 +842,8 @@ def run_cli(client: AppClient):
         print("6. Start Car")
         print("7. Lock Car")
         print("8. Stop Car")
+        print("9. REPLAY Last Car Command (Exact)")
+        print("10. REPLAY Last Car Command (Updated Timestamp, Old Signature & SeqNo)") # Clarified name
         print("0. Exit")
 
         choice = input("Enter your choice: ")
@@ -844,7 +891,51 @@ def run_cli(client: AppClient):
             # --- NEW CASE ---
             elif choice == '8':
                 client.request_car_action("STOP_CAR_REQUEST")
-            # ----------------
+            elif choice == '9':  # REPLAY EXACT
+                if AppClient.last_sent_car_message_for_replay:
+                    logging.warning("---!!! ATTEMPTING EXACT REPLAY ATTACK !!!---")
+                    original_message = AppClient.last_sent_car_message_for_replay
+
+                    # Prepare the payload_override for request_car_action
+                    payload_to_send_for_replay = original_message.get("payload")
+
+                    if payload_to_send_for_replay:
+                        client.request_car_action(
+                            action_type=original_message.get("type"),
+                            payload_override=payload_to_send_for_replay
+                        )
+                    else:
+                        print("Could not replay: Original payload details missing from captured message.")
+                    logging.warning("---!!! EXACT REPLAY ATTEMPT COMPLETE !!!---")
+                else:
+                    print("No car command has been sent yet in this session to replay.")
+
+            elif choice == '10':  # REPLAY WITH UPDATED TIMESTAMP but old signature and sequence
+                if AppClient.last_sent_car_message_for_replay:
+                    logging.warning("---!!! ATTEMPTING REPLAY ATTACK WITH UPDATED TIMESTAMP (OLD SIG/SEQ) !!!---")
+                    original_message = AppClient.last_sent_car_message_for_replay
+                    original_payload = original_message.get("payload")
+                    original_message_type = original_message.get("type")
+
+                    if original_payload and original_message_type:
+                        new_timestamp = int(time.time())  # Fresh timestamp
+
+                        # Construct the payload to send, using old sequence and old signature (auth_data)
+                        payload_with_updated_timestamp = {
+                            "timestamp": new_timestamp,
+                            "sequence_number": original_payload.get("sequence_number"),  # Old sequence
+                            "auth_data": original_payload.get("auth_data")  # Old signature
+                        }
+
+                        client.request_car_action(
+                            action_type=original_message_type,
+                            payload_override=payload_with_updated_timestamp
+                        )
+                    else:
+                        print("Cannot replay with updated timestamp: Original message details missing.")
+                    logging.warning("---!!! UPDATED TIMESTAMP (OLD SIG/SEQ) REPLAY ATTEMPT COMPLETE !!!---")
+                else:
+                    print("No car command has been sent yet in this session to replay.")
             elif choice == '0':
                 print("Exiting.")
                 break
@@ -859,6 +950,14 @@ def run_cli(client: AppClient):
 # --- Main Execution Block ---
 if __name__ == "__main__":
     # --- New Login/Signup Loop ---
+    parser = argparse.ArgumentParser(description="Smartphone Car Access App Client.")
+    parser.add_argument(
+        '--mitm-test',
+        action='store_true', # Makes it a boolean flag
+        help="Run in Man-in-the-Middle test mode (connects car via proxy on specified MitM port)."
+    )
+    args = parser.parse_args()
+
     logged_in_user_id = None
     while logged_in_user_id is None:
         print("\n--- Welcome ---")
@@ -927,7 +1026,7 @@ if __name__ == "__main__":
         print(f"\nStarting app client for authenticated user: {logged_in_user_id}")
         try:
             # Initialize AppClient AFTER login, using the logged-in user ID
-            app_client = AppClient(logged_in_user_id)
+            app_client = AppClient(logged_in_user_id, mitm_test_mode=args.mitm_test)
             run_cli(app_client) # Start the main application menu
         except SystemExit as e:
              print(f"Exiting due to critical setup error: {e}")
