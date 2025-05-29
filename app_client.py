@@ -718,14 +718,10 @@ class AppClient:
              logging.error(f"Delegation failed: {error}")
              return None
 
-    def revoke_delegation(self, delegation_id: str | None = None): # <-- Make delegation_id optional
+    def revoke_delegation(self): # <-- Make delegation_id optional
          """Revokes a previously created delegation."""
-         if delegation_id:
-             logging.info(f"Attempting to revoke specific delegation ID: {delegation_id}...")
-             payload_content = {"delegation_id": delegation_id}
-         else:
-             logging.info(f"Attempting to revoke user '{self.user_id}'s last active delegation (server-side determination)...")
-             payload_content = {} # Empty payload, server will figure it out
+         logging.info(f"Attempting to revoke user '{self.user_id}'s last active delegation (server-side determination)...")
+         payload_content = {} # Empty payload, server will figure it out
          message = {
             "type": "REVOKE_DELEGATION",
             "sender_id": self.user_id, # Must be owner
@@ -734,13 +730,11 @@ class AppClient:
          response = self._send_and_receive(self.server_addr, message)
          if response and response.get("type") == "REVOKE_DELEGATION_ACK":
              revoked_id = response.get("payload", {}).get("delegation_id", "Unknown")
-             logging.info(f"Delegation '{delegation_id}' revoked successfully!")
-             if self.last_delegation_id == delegation_id:
-                 self.last_delegation_id = None
+             logging.info(f"Delegation revoked successfully!")
              return True
          else:
              error = response.get("payload", {}).get("error", "Unknown error") if response else "No response"
-             action_type = f"specific delegation '{delegation_id}'" if delegation_id else "last active delegation"
+             action_type = f"specific delegation" "last active delegation"
              logging.error(f"Failed to revoke {action_type}: {error}")
              return False
 
