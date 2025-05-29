@@ -2,13 +2,16 @@
 import socket
 import threading
 import logging
-import ssl # <-- Import ssl
-from utils import config, network_utils
+import ssl
+import time
+import json # Import json for reconstructing signed data
+from utils import config, network_utils, crypto
 import os
 # --- Need cryptography for parsing cert and serializing key ---
 from cryptography import x509
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives.asymmetric import ec # For type hinting public key
 
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - CarServer [{car_id}] - %(threadName)s - %(levelname)s - %(message)s')
 
@@ -17,6 +20,7 @@ class CarServer:
         self.car_id = car_id
         self.host = host
         self.port = port
+        self.car_private_key = None # Assuming car also has a key for signing its own messages if needed
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.is_unlocked = False
@@ -27,11 +31,17 @@ class CarServer:
         self.logger = logging.getLogger(__name__)
         self.logger_adapter = logging.LoggerAdapter(self.logger, {'car_id': self.car_id})
 
+        self.app_public_key_cache = {}
+        self.app_key_cache_lock = threading.Lock()
+
         # --- TLS Setup ---
         # Context for incoming connections from AppClient
         self.incoming_ssl_context = self._create_incoming_ssl_context() # Renamed
         # NEW: Context for outgoing connections to BackendServer
         self.outgoing_ssl_context = self._create_outgoing_ssl_context()
+
+        self.user_sequence_numbers = {}
+        self.sequence_lock = threading.Lock() # Lock for accessing user_sequence_numbers
 
         # TODO (AUTH): Load car's private key securely (e.g., from file/secure element).
         self.car_private_key = None # Replace with actual key object
@@ -251,136 +261,217 @@ class CarServer:
                  backend_tls_sock.close()
         return False # Default to false if any error path not returning explicitly
 
-
-    def handle_client(self, ssl_client_socket: ssl.SSLSocket, address): # <-- Takes SSLSocket now
+    def handle_client(self, ssl_client_socket: ssl.SSLSocket, address):
         threading.current_thread().name = f"App-{address[0]}:{address[1]}"
         self._log(logging.INFO, f"TLS connection established with {address}")
 
-        # Extract full app certificate PEM
-        app_certificate_pem_str = None
+        app_public_key: ec.EllipticCurvePublicKey | None = None
+        app_cert_cn: str | None = None  # Common Name from app's cert
+        app_full_cert_pem_for_backend_validation: str | None = None  # For backend validation
 
         try:
+            # --- Extract App's Public Key and CN from Client Certificate ---
             app_cert_der = ssl_client_socket.getpeercert(binary_form=True)
             if not app_cert_der:
-                 raise ValueError("Could not get peer certificate (app) in binary form.")
-            
+                raise ValueError("Could not get app certificate (DER) from TLS session.")
+
             app_cert_obj = x509.load_der_x509_certificate(app_cert_der, default_backend())
-            # Serialize the *entire certificate* to PEM
-            app_certificate_pem_str = app_cert_obj.public_bytes(
-                 encoding=serialization.Encoding.PEM
-            ).decode('utf-8')
-            self._log(logging.INFO, f"App's full certificate PEM extracted for validation.")
+            app_full_cert_pem_for_backend_validation = app_cert_obj.public_bytes(serialization.Encoding.PEM).decode(
+                'utf-8')
+
+            # Extract CN
+            try:
+                app_cert_cn = app_cert_obj.subject.get_attributes_for_oid(x509.oid.NameOID.COMMON_NAME)[0].value
+                self._log(logging.INFO, f"App client certificate CN: {app_cert_cn}")
+            except IndexError:
+                self._log(logging.WARNING, "App client certificate is missing Common Name (CN).")
+                # Depending on policy, might reject here or rely on backend validation later
+
+            # Extract Public Key object
+            app_public_key = app_cert_obj.public_key()
+            if not isinstance(app_public_key, ec.EllipticCurvePublicKey):  # Check type
+                raise ValueError("App client certificate public key is not ECC type as expected.")
+
+            # Optional: Cache the public key associated with the CN
+            if app_cert_cn and app_public_key:
+                with self.app_key_cache_lock:
+                    self.app_public_key_cache[app_cert_cn] = app_public_key
+                self._log(logging.DEBUG, f"Cached public key for app cert CN: {app_cert_cn}")
 
         except (ValueError, TypeError, ssl.SSLError) as e:
-             self._log(logging.ERROR, f"Failed to get or process app certificate from {address}: {e}. Closing connection.")
-             try: ssl_client_socket.close()
-             except Exception: pass
-             return
-        except Exception as e:
-            self._log(logging.ERROR, f"Unexpected error getting app certificate from {address}: {e}. Closing connection.")
-            try: ssl_client_socket.close()
-            except Exception: pass
+            self._log(logging.ERROR, f"Failed to get/process app certificate from {address}: {e}. Closing connection.")
+            try:
+                ssl_client_socket.close(); return
+            except Exception:
+                pass
+        except Exception as e:  # Catch-all for unexpected
+            self._log(logging.ERROR,
+                      f"Unexpected error getting app certificate from {address}: {e}. Closing connection.")
+            try:
+                ssl_client_socket.close(); return
+            except Exception:
+                pass
+        first_message_for_validation = network_utils.receive_message(ssl_client_socket)
+        if not first_message_for_validation:
+            self._log(logging.WARNING, f"No initial message received from {address} after TLS handshake. Closing.")
+            ssl_client_socket.close()
             return
 
-        # --- Log Client Cert Info (Optional Debugging) ---
-        try:
-            client_cert = ssl_client_socket.getpeercert()
-            if client_cert:
-                 subject = dict(x[0] for x in client_cert.get('subject', []))
-                 issuer = dict(x[0] for x in client_cert.get('issuer', []))
-                 self._log(logging.DEBUG, f"Client Cert Subject: {subject}")
-                 self._log(logging.DEBUG, f"Client Cert Issuer: {issuer}")
-                 # You could potentially use subject CN or other fields for app-level checks
-            else:
-                 self._log(logging.WARNING, "Could not get peer certificate details.")
-        except Exception as e:
-             self._log(logging.WARNING, f"Error getting peer certificate: {e}")
-        # -------------------------------------------------
+        requesting_user_id_from_first_msg = first_message_for_validation.get('sender_id')
+        if not requesting_user_id_from_first_msg:
+            self._log(logging.ERROR, f"Initial message from {address} missing 'sender_id'. Closing.")
+            # Send an error back if possible, then close
+            err_resp = {"type": "ERROR", "sender_id": self.car_id,
+                        "payload": {"error": "Initial message requires sender_id"}}
+            network_utils.send_message(ssl_client_socket, err_resp)
+            ssl_client_socket.close()
+            return
 
+        # Now validate the presented app certificate against this sender_id with the backend
+        if not self._validate_app_pubkey_with_server(app_full_cert_pem_for_backend_validation,
+                                                     requesting_user_id_from_first_msg):
+            self._log(logging.WARNING,
+                      f"Backend validation of app cert failed for user '{requesting_user_id_from_first_msg}' (CN: {app_cert_cn}). Closing connection.")
+            err_resp = {"type": "ERROR", "sender_id": self.car_id,
+                        "payload": {"error": "App certificate not valid for specified user."}}
+            network_utils.send_message(ssl_client_socket, err_resp)
+            ssl_client_socket.close()
+            return
+        self._log(logging.INFO,
+                  f"Backend validation of app cert for user '{requesting_user_id_from_first_msg}' (CN: {app_cert_cn}) successful.")
+
+        # Process the first message, then loop for more
         try:
+            # Pass the extracted app_public_key to process_message
+            response = self.process_message(first_message_for_validation, app_public_key, app_cert_cn,
+                                            ssl_client_socket)
+            if response:
+                if not network_utils.send_message(ssl_client_socket, response):
+                    self._log(logging.WARNING, f"Failed to send response (1) to {address}.")
+                    # Don't break yet, might be a one-off send issue
+
             while True:
-                # Use the SSL socket for communication
                 message = network_utils.receive_message(ssl_client_socket)
                 if message is None:
-                    break
+                    break  # Connection closed or error in receive_message
 
-                # Pass full app_certificate_pem_str
-                response = self.process_message(message, app_certificate_pem_str, ssl_client_socket)
-                
+                response = self.process_message(message, app_public_key, app_cert_cn, ssl_client_socket)
                 if response:
-                    # Send response over the SSL socket
                     if not network_utils.send_message(ssl_client_socket, response):
-                         self._log(logging.WARNING, f"Failed to send response to {address}. Closing TLS connection.")
-                         break
+                        self._log(logging.WARNING, f"Failed to send response to {address}. Closing TLS connection.")
+                        break
+        # ... (rest of handle_client: except blocks, finally block to close socket) ...
         except ConnectionResetError:
-             self._log(logging.INFO, f"Connection reset by peer {address}")
+            self._log(logging.INFO, f"Connection reset by peer {address}")
         except ssl.SSLError as e:
             self._log(logging.ERROR, f"SSL Error during communication with {address}: {e}")
         except Exception as e:
-            self._log(logging.ERROR, f"Error handling client {address}: {e}")
+            self._log(logging.ERROR, f"Error handling client {address}: {e}", exc_info=True)
         finally:
             self._log(logging.INFO, f"Closing TLS connection from {address}")
+            # Clean up cached key for this specific CN if it was a short-lived session concept
+            if app_cert_cn:
+                with self.app_key_cache_lock:
+                    self.app_public_key_cache.pop(app_cert_cn, None)
             try:
                 ssl_client_socket.shutdown(socket.SHUT_RDWR)
             except OSError:
-                pass # Ignore if already closed
+                pass
             ssl_client_socket.close()
 
-    def process_message(self, message: dict, app_certificate_pem_str: str, ssl_sock: ssl.SSLSocket) -> dict | None:        
+    def process_message(self, message: dict, app_public_key: ec.EllipticCurvePublicKey | None, app_cert_cn: str | None, ssl_sock: ssl.SSLSocket) -> dict | None:
         msg_type = message.get('type')
-        # This is the user interacting with the car via the app
-        requesting_user_id = message.get('sender_id')        
-        payload = message.get('payload', {}) # Use if needed
-        response = {"sender_id": self.car_id} # Initialize response
-        # TODO (AUTH): Extract signature/auth_data from payload.
-        #   auth_data = payload.get('auth_data') # Could be signature or signed nonce
-        if not msg_type or not requesting_user_id:
-            self._log(logging.WARNING, f"Received incomplete message: {message}")
-            return {"type": "ERROR", "sender_id": self.car_id, "payload": {"error": "Incomplete message (missing type or sender_id)"}}
-
-        self._log(logging.INFO, f"Processing message type '{msg_type}' from user '{requesting_user_id}'")
-
-        # ---=== Step 1: Validate App Public Key against User ID ===---
-        # Validate app's full certificate PEM
-        if not self._validate_app_pubkey_with_server(app_certificate_pem_str, requesting_user_id):
-             self._log(logging.WARNING, f"Authentication failed for user '{requesting_user_id}' due to app certificate mismatch.")
-             nak_type = "ERROR"
-             if msg_type.endswith("_REQUEST"): nak_type = msg_type.replace("_REQUEST", "_NAK")
-             return {"type": nak_type, "sender_id": self.car_id, "payload": {"error": "Authentication failed (certificate validation)"}} # More specific error
-        # ---=== Validation Successful ===---
-
-
-        # --- Step 2: Proceed with message processing (permission checks, etc.) ---
+        requesting_user_id = message.get('sender_id') # This is user_id from payload
+        payload = message.get('payload', {})
         response = {"sender_id": self.car_id}
+        if not msg_type or not requesting_user_id:
+            # ... (incomplete message handling) ...
+            return {"type": "ERROR", "sender_id": self.car_id, "payload": {"error": "Incomplete message"}}
+        self._log(logging.INFO, f"Processing message type '{msg_type}' from user '{requesting_user_id}' (App Cert CN: {app_cert_cn})")
 
-        # --- Helper for App Signature Verification ---
-        def verify_app_signature(user_id, data_signed, signature):
-            # TODO (AUTH): Implement this function.
-            # 1. Get user's public key (e.g., from cache self.user_public_keys_cache or request from server).
-            # 2. Verify the signature against the data_signed.
-            # 3. Return True/False. Handle key not found, invalid sig.
-            self._log(logging.WARNING, f"AUTH PLACEHOLDER: App signature verification for user '{user_id}' not implemented.")
-            # For Challenge-Response:
-            # - Need to store the nonce sent to the app.
-            # - Verify signature against the *stored nonce*.
-            # - Invalidate nonce after use.
-            return True # Placeholder
+        if app_cert_cn != requesting_user_id:
+            self._log(logging.WARNING, f"SECURITY ALERT: Payload sender_id '{requesting_user_id}' MISMATCHES authenticated TLS CN '{app_cert_cn}'. Rejecting.")
+            nak_type = msg_type.replace("_REQUEST", "_NAK") if msg_type.endswith("_REQUEST") else "ERROR"
+            return {"type": nak_type, "sender_id": self.car_id, "payload": {"error": "Identity mismatch (payload vs TLS cert)"}}
+        # --- Replay Protection & Signature Verification ---
+        action_requests_needing_replay_protection = [
+            "UNLOCK_REQUEST", "START_REQUEST", "LOCK_REQUEST", "STOP_CAR_REQUEST"
+        ]
 
+        if msg_type in action_requests_needing_replay_protection:
+            timestamp = payload.get("timestamp")
+            sequence_number = payload.get("sequence_number")
+            auth_data_dict = payload.get("auth_data")
+
+            if timestamp is None or sequence_number is None or auth_data_dict is None or "signature" not in auth_data_dict:
+                # ... (return error: Missing replay/auth fields) ...
+                self._log(logging.WARNING, f"Missing replay/auth fields for {msg_type} from {requesting_user_id}")
+                return {"type": msg_type.replace("_REQUEST", "_NAK"), "sender_id": self.car_id,
+                        "payload": {"error": "Missing replay or auth fields"}}
+
+
+            # --- 1.1: Verify Signature ---
+            auth_data_dict = payload.get("auth_data")
+            signature_hex = auth_data_dict.get("signature")
+            if not app_public_key:  # Should have been extracted in handle_client
+                self._log(logging.ERROR,
+                          f"CRITICAL: App public key not available for signature verification for user {requesting_user_id}.")
+                return {"type": msg_type.replace("_REQUEST", "_NAK"), "sender_id": self.car_id,
+                        "payload": {"error": "Internal error: cannot verify signature (no key)"}}
+
+            data_that_was_signed_dict = {
+                "action": msg_type,
+                "user_id": requesting_user_id,
+                "car_id": self.car_id,
+                "timestamp": timestamp,
+                "sequence_number": sequence_number
+            }
+            data_that_was_signed_bytes = json.dumps(data_that_was_signed_dict, sort_keys=True,
+                                                    separators=(',', ':')).encode('utf-8')
+
+            try:
+                signature_bytes = bytes.fromhex(signature_hex)
+                is_signature_valid = crypto.verify_signature(app_public_key, signature_bytes,
+                                                             data_that_was_signed_bytes)
+            except ValueError:  # fromhex error
+                is_signature_valid = False
+                self._log(logging.WARNING, f"Invalid signature hex format for {msg_type} from {requesting_user_id}.")
+            except Exception as e:  # Catch other crypto errors
+                is_signature_valid = False
+                self._log(logging.ERROR,
+                          f"Error during signature verification for {msg_type} from {requesting_user_id}: {e}")
+
+            if not is_signature_valid:
+                self._log(logging.WARNING, f"SIGNATURE VERIFICATION FAILED for {msg_type} from {requesting_user_id}.")
+                # DO NOT update sequence number here, as it might be an attacker trying to burn sequence numbers.
+                return {"type": msg_type.replace("_REQUEST", "_NAK"), "sender_id": self.car_id,
+                        "payload": {"error": "Invalid signature on command"}}
+
+            self._log(logging.INFO, f"SIGNATURE OK for {msg_type} from {requesting_user_id}.")
+            # 1.2 Validate timestamp only if signature is valid
+            current_server_time = int(time.time())
+            if abs(current_server_time - timestamp) > config.TIMESTAMP_WINDOW_SECONDS:
+                self._log(logging.WARNING, f"REPLAY DETECTED (Timestamp) for {msg_type} from {requesting_user_id}")
+                return {"type": msg_type.replace("_REQUEST", "_NAK"), "sender_id": self.car_id,
+                        "payload": {"error": "Replay detected (invalid timestamp)"}}
+
+            # 1.3 Validate Sequence Number - only if signature is valid
+            with self.sequence_lock:
+                last_seen_sequence = self.user_sequence_numbers.get(requesting_user_id, -1)
+                if sequence_number <= last_seen_sequence:
+                    self._log(logging.WARNING,
+                              f"REPLAY DETECTED (Sequence after Sig OK): {msg_type} from {requesting_user_id}. Recv: {sequence_number}, Last: {last_seen_sequence}")
+                    return {"type": msg_type.replace("_REQUEST", "_NAK"), "sender_id": self.car_id,
+                            "payload": {"error": "Replay detected (invalid sequence number)"}}
+                self.user_sequence_numbers[requesting_user_id] = sequence_number
+                self._log(logging.DEBUG,
+                          f"REPLAY CHECK: Valid sequence number {sequence_number} for user {requesting_user_id}. Updated last seen.")
+
+            self._log(logging.INFO,
+                      f"ALL CHECKS OK (Timestamp/SeqNo/Signature) for {msg_type} from {requesting_user_id}.")
+        # --- Step 2: Proceed with message processing (permission checks, etc.) ---
         # --- Car Actions (require validation AND direct app auth) ---
         action_requires_direct_auth = msg_type in ["UNLOCK_REQUEST", "START_REQUEST", "LOCK_REQUEST", "STOP_CAR_REQUEST"]
-
-        # TODO (AUTH): Add Challenge-Response Handling Here if applicable
-        #   - If msg_type is INITIATE_UNLOCK/START: generate nonce, store it mapped to user/session, send back nonce.
-        #   - If msg_type is UNLOCK/START_REQUEST: Retrieve expected nonce, verify signed nonce in auth_data.
-
-        if action_requires_direct_auth:
-             # TODO (AUTH): Perform direct verification of the app's request *before* contacting the server.
-             #   Extract signature/signed nonce from auth_data.
-             #   data_to_verify = ... # Depends on what the app signs (nonce or payload)
-             #   if not verify_app_signature(requesting_user_id, data_to_verify, auth_data):
-             #       self._log(logging.warning, f"Direct authentication failed for {requesting_user_id} for action {msg_type}")
-             #       return {"type": f"{msg_type.split('_')[0]}_NAK", "payload": {"error": "Direct authentication failed"}}
-             pass # Placeholder for actual verification call
 
         # --- Car Actions (require validation) ---
         if msg_type == "UNLOCK_REQUEST":
