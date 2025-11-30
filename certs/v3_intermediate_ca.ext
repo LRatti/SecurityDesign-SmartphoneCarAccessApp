@@ -1,4 +1,2 @@
-subjectKeyIdentifier = hash
-authorityKeyIdentifier = keyid:always,issuer
 basicConstraints = critical, CA:true, pathlen:0
 keyUsage = critical, digitalSignature, cRLSign, keyCertSign

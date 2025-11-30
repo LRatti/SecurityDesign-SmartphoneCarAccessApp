@@ -1,9 +1,0 @@
-{
-    "testingl": {
-        "certificate_fingerprint_sha256": "8add4e6e52887773961017281cb987a60d23743568faf316e7cc9cedf584bba5",
-        "pin_salt": "d3e6ec19745e71aa2dc09010a584fed3",
-        "pin_hash": "93f42718c9b18fdb5979ecae82517cc88f66d73c2ffa784efe35a9c334e56b94",
-        "license_valid": true,
-        "license_expiry_timestamp": 1778266202.368641
-    }
-}

@@ -59,8 +59,8 @@ PROVISIONING_APP_CERT_FILE = os.path.join(CERT_DIR, 'app-cert.pem')
 PROVISIONING_APP_KEY_FILE = os.path.join(CERT_DIR, 'app-key.pem')
 
 # Backend Server Certificates (NEW)
-SERVER_CERT_FILE = os.path.join(CERT_DIR, 'server-cert.pem')
-SERVER_KEY_FILE = os.path.join(CERT_DIR, 'server-key.pem')
+SERVER_CERT_FILE = os.path.join(CERT_DIR, 'backend-cert.pem')
+SERVER_KEY_FILE = os.path.join(CERT_DIR, 'backend-key.pem')
 
 # Intermediate CA (NEW)
 INTERMEDIATE_CA_KEY_FILE = os.path.join(CERT_DIR, 'intermediate-ca-key.pem')

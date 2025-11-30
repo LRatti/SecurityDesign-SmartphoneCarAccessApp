@@ -24,9 +24,6 @@ The system is composed of three main components that communicate securely:
 
 ### Communication Flow
 
-![A good place for a diagram showing the interaction between the App, Server, and Car during an authentication handshake.](https://via.placeholder.com/800x400.png?text=Architectural+Flow+Diagram)
-*(You can replace the placeholder link above with a real diagram from your report.)*
-
 The core of the security relies on a **mutual authentication** process where the app and the car verify each other's identity using digital certificates signed by the trusted backend server. Session keys are established using the **Elliptic Curve Diffie-Hellman (ECDH)** protocol to ensure Perfect Forward Secrecy.
 
 ## 🛡️ Security Mechanisms Deep Dive
@@ -55,20 +52,15 @@ A proof-of-concept application was developed in Python to simulate the security 
 
 1.  **Clone the repository:**
     ```sh
-    git clone https://github.com/your-username/your-repository-name.git
     cd your-repository-name
+    git clone 
+    
     ```
 
-2.  **Install the required dependencies:**
-    ```sh
-    pip install -r requirements.txt
-    ```
+2.  **Install the required dependencies.** For more information refer to the "how_to_test.md" file in the README directory.
 
-3.  **Run the simulation:**
+3.  **Run the simulation** as described by the "how_to_test.md" file in the README directory.
     The PoC simulates the interactions between the user, the car, and the server.
-    ```sh
-    python main_simulation.py
-    ```
 
 ### Demonstrating Attacks
 
@@ -95,7 +87,7 @@ The PoC also includes scripts to simulate specific attacks and show how the syst
 -   Furkan Poyraz
 -   Maurizio Perriello
 
-## 🙏 Acknowledgments
+## Acknowledgments
 
--   We thank Professor **Eric Laermans** for his guidance and for providing the assignment that inspired this project.
+-   The project was carried out onder the supervision of Professor **Eric Laermans**.
 -   **Ghent University**, Faculty of Engineering and Architecture.
