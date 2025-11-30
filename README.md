@@ -80,12 +80,12 @@ The PoC also includes scripts to simulate specific attacks and show how the syst
 
 ## 👥 Authors
 
--   Besar Jukaj
--   Francisco Alves
--   Stefanos Panagoulias
--   Leonardo Ratti
--   Furkan Poyraz
--   Maurizio Perriello
+-   [Besar Jukaj](https://github.com/bjukaj)
+-   [Francisco Alves](https://github.com/papichickens)
+-   [Stefanos Panagoulias](https://github.com/StefanosPanagoulias)
+-   [Leonardo Ratti](https://github.com/LRatti)
+-   [Furkan Poyraz](https://github.com/furkypoyry)
+-   [Maurizio Perriello](https://www.instagram.com/maurizio.perriello/)
 
 ## Acknowledgments
 
